@@ -1,0 +1,10 @@
+# Runtime: the rules engine for Python
+bandit
+
+# Optional: only for the Azure Foundry adapter (adapters/foundry_llm.py)
+azure-ai-inference
+
+# Development and tests: the contract check
+pyyaml
+jsonschema
+openapi-spec-validator

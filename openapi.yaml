@@ -1,0 +1,829 @@
+openapi: 3.1.0
+info:
+  title: Flwn security service API
+  version: 1.0.0
+  summary: Scan generated code for vulnerabilities, propose fixes, and verify them.
+  description: |
+    An independent service. It never imports Flwn code and never reads Flwn data. Flwn sends
+    code in and gets a structured security assessment back; nothing else is shared.
+
+    What the service promises, and what it does not:
+    - A decision of `pass` means only that nothing was found by the checks that ran, on the files
+      that were scanned. Every report carries a coverage statement; read it. It is never a
+      guarantee that the code is secure.
+    - The service never executes submitted code, and never applies a fix. A fix is a proposed
+      patch plus a verification result; the caller decides what to do with it.
+    - Providers (models and tools) can be replaced without any change to this contract.
+      `provenance` names the engines behind a result for audit only. Clients must not branch on it.
+
+    Conventions:
+    - Changes inside `/v1` are additive only: new optional fields, new enum values, new endpoints.
+      Clients must ignore unknown fields and treat any unknown `decision` value as `review_required`.
+    - Every request that creates something accepts an `Idempotency-Key`; a repeat with the same key
+      and body returns the original resource instead of creating a second one.
+    - Operations are asynchronous. Send `Prefer: wait=N` to have the service hold the request up to N
+      seconds and answer inline if the work finishes in time; otherwise you get `202` and poll the
+      resource. Provider latency therefore never changes the contract.
+    - Authentication is a service-to-service API key in `Authorization: Bearer <key>`. Keys carry
+      scopes: `scan` (create scans and verifications), `fix` (request fixes), `read` (fetch resources).
+    - `workspace_id` is an opaque tenant tag. The service uses it for quotas, audit and the
+      data-handling policy that decides which providers may see a tenant's code; it is not checked
+      against any Flwn system.
+    - Submitted code is kept only for the retention window in `GET /v1/capabilities`, and can be
+      removed earlier with `DELETE /v1/scans/{scan_id}`.
+    - Any operation can also answer `500` with a `Problem` whose `code` is `internal_error`. The body
+      never contains internal details such as stack traces or provider messages.
+servers:
+  - url: https://security.internal.example
+    description: Placeholder. Replace with the deployed address.
+security:
+  - bearerAuth: []
+tags:
+  - name: scans
+  - name: fixes
+  - name: verifications
+  - name: meta
+
+paths:
+  /v1/scans:
+    post:
+      tags: [scans]
+      operationId: createScan
+      summary: Submit files for scanning
+      description: Requires scope `scan`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/Prefer'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ScanRequest'}
+      responses:
+        '200':
+          description: The scan finished within the requested wait. `report` is present.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Scan'}
+        '202':
+          description: Accepted. Poll `GET /v1/scans/{scan_id}`.
+          headers:
+            Location:
+              description: URL of the scan resource.
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Scan'}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '422': {$ref: '#/components/responses/UnsupportedLanguage'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+
+  /v1/scans/{scan_id}:
+    parameters:
+      - $ref: '#/components/parameters/ScanId'
+    get:
+      tags: [scans]
+      operationId: getScan
+      summary: Get a scan and, once finished, its report
+      description: Requires scope `read`.
+      responses:
+        '200':
+          description: The scan resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Scan'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+    delete:
+      tags: [scans]
+      operationId: deleteScan
+      summary: Purge a scan and the code and results stored for it
+      description: Requires scope `scan`. Also removes fixes and verifications that belong to the scan.
+      responses:
+        '204': {description: Purged.}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /v1/scans/{scan_id}/fixes:
+    parameters:
+      - $ref: '#/components/parameters/ScanId'
+    post:
+      tags: [fixes]
+      operationId: createFix
+      summary: Ask for fixes for findings of a finished scan
+      description: Requires scope `fix`. The scan must be completed.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/Prefer'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/FixRequest'}
+      responses:
+        '200':
+          description: The fix finished within the requested wait.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Fix'}
+        '202':
+          description: Accepted. Poll `GET /v1/fixes/{fix_id}`.
+          headers:
+            Location:
+              description: URL of the fix resource.
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Fix'}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+
+  /v1/fixes/{fix_id}:
+    parameters:
+      - $ref: '#/components/parameters/FixId'
+    get:
+      tags: [fixes]
+      operationId: getFix
+      summary: Get a fix, its patches, and the verification outcome
+      description: Requires scope `read`.
+      responses:
+        '200':
+          description: The fix resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Fix'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /v1/verifications:
+    post:
+      tags: [verifications]
+      operationId: createVerification
+      summary: Verify a corrected version that the caller produced
+      description: |
+        Requires scope `scan`. Checks corrected files against an earlier scan: they must parse,
+        the original findings should be gone, and nothing new at medium severity or above may appear.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/Prefer'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/VerificationRequest'}
+      responses:
+        '200':
+          description: Verification finished within the requested wait.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Verification'}
+        '202':
+          description: Accepted. Poll `GET /v1/verifications/{verification_id}`.
+          headers:
+            Location:
+              description: URL of the verification resource.
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Verification'}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+
+  /v1/verifications/{verification_id}:
+    parameters:
+      - $ref: '#/components/parameters/VerificationId'
+    get:
+      tags: [verifications]
+      operationId: getVerification
+      summary: Get a verification result
+      description: Requires scope `read`.
+      responses:
+        '200':
+          description: The verification resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Verification'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /v1/capabilities:
+    get:
+      tags: [meta]
+      operationId: getCapabilities
+      summary: Languages, limits and versions this deployment supports
+      description: Read this at startup so limits and languages are never hard-coded in the client.
+      responses:
+        '200':
+          description: Current capabilities.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Capabilities'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /healthz:
+    get:
+      tags: [meta]
+      operationId: getHealth
+      summary: Liveness
+      security: []
+      responses:
+        '200':
+          description: The process is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status]
+                properties:
+                  status: {type: string, const: ok}
+
+  /readyz:
+    get:
+      tags: [meta]
+      operationId: getReadiness
+      summary: Readiness (can it do useful work right now)
+      security: []
+      responses:
+        '200':
+          description: Ready.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Readiness'}
+        '503':
+          description: Not ready. The body says which dependency is failing.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Readiness'}
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Service-to-service API key. Scopes are `scan`, `fix` and `read`.
+
+  parameters:
+    ScanId:
+      name: scan_id
+      in: path
+      required: true
+      schema: {type: string, maxLength: 100}
+    FixId:
+      name: fix_id
+      in: path
+      required: true
+      schema: {type: string, maxLength: 100}
+    VerificationId:
+      name: verification_id
+      in: path
+      required: true
+      schema: {type: string, maxLength: 100}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Any unique string up to 200 characters. Strongly recommended on every POST.
+      schema: {type: string, maxLength: 200}
+    Prefer:
+      name: Prefer
+      in: header
+      required: false
+      description: |
+        `wait=N`, N from 1 to the limit in capabilities. Hold the request up to N seconds and answer
+        with `200` if the work finishes in time, else `202`.
+      schema: {type: string, pattern: '^wait=[0-9]{1,3}$'}
+
+  responses:
+    InvalidRequest:
+      description: The request is malformed (empty files, bad paths, duplicate paths, wrong types).
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Unauthorized:
+      description: Missing or invalid API key.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Forbidden:
+      description: The key lacks the required scope, or the tenant's data policy forbids the operation.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    NotFound:
+      description: No such resource, or it was purged or has expired.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    IdempotencyConflict:
+      description: The Idempotency-Key was used before with a different body.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    PayloadTooLarge:
+      description: Too many files, or too many bytes. Limits are in `GET /v1/capabilities`.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    UnsupportedLanguage:
+      description: The request-level `language` is not one this deployment supports. Per-file languages that are unsupported are skipped, not rejected.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    RateLimited:
+      description: Too many requests. Retry after the delay in the `Retry-After` header.
+      headers:
+        Retry-After:
+          schema: {type: integer, minimum: 0}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Unavailable:
+      description: The service cannot do the work right now. Retry with backoff.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+
+  schemas:
+    Decision:
+      type: string
+      enum: [pass, review_required, block, scan_failed]
+      description: |
+        pass: nothing reached the review threshold within the checks that ran on the files scanned.
+        review_required: a human must look (findings, or source files that were not scanned).
+        block: a rule-backed, high-severity, high-confidence finding. A model alone never blocks.
+        scan_failed: the checks could not complete. Never treat as pass.
+        Treat any value you do not recognize as review_required.
+    Severity:
+      type: string
+      enum: [info, low, medium, high, critical]
+    Confidence:
+      type: string
+      enum: [low, medium, high]
+      description: How sure the evidence is. A coarse level, not a calibrated probability.
+    EvidenceTier:
+      type: string
+      enum: [static_rule, model_suspicion, corroborated]
+    VulnerabilityType:
+      type: string
+      enum:
+        - code_injection
+        - command_injection
+        - debug_enabled
+        - hardcoded_credentials
+        - insecure_deserialization
+        - insecure_random
+        - insecure_temp_file
+        - other
+        - path_traversal
+        - sql_injection
+        - ssrf
+        - tls_verification_disabled
+        - weak_crypto
+        - xss_or_template_injection
+      description: New categories may be added; clients must tolerate values they do not know.
+    JobStatus:
+      type: string
+      enum: [queued, running, completed, failed]
+      description: The state of the job itself. `failed` means the job crashed, which is different from a report whose decision is scan_failed.
+
+    InputFile:
+      type: object
+      additionalProperties: false
+      required: [path, content]
+      properties:
+        path:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: A label for the file. Nothing is ever read from or written to this path.
+        content:
+          type: string
+        language:
+          type: [string, 'null']
+          description: Overrides the request-level language and the file extension.
+
+    ScanContext:
+      type: object
+      additionalProperties: false
+      description: Optional hints for engines. Accepted now but currently ignored; reserved so adding hint support is not a contract change.
+      properties:
+        framework: {type: string, maxLength: 100}
+        untrusted_inputs:
+          type: array
+          maxItems: 50
+          items: {type: string, maxLength: 200}
+        purpose: {type: string, maxLength: 500}
+
+    ScanRequest:
+      type: object
+      additionalProperties: false
+      required: [files]
+      properties:
+        client_ref:
+          type: string
+          maxLength: 200
+          description: Your own reference (for example a work item id). Echoed back.
+        workspace_id:
+          type: string
+          maxLength: 200
+        language:
+          type: string
+          description: Default language for files that do not name one. Unsupported values are rejected with 422.
+        files:
+          type: array
+          minItems: 1
+          items: {$ref: '#/components/schemas/InputFile'}
+        context: {$ref: '#/components/schemas/ScanContext'}
+
+    Finding:
+      type: object
+      additionalProperties: false
+      required: [id, path, vulnerability_type, severity, confidence, evidence_tier, sources, rule_id, cwe, line, evidence, description, recommendation, reference]
+      properties:
+        id:
+          type: string
+          description: 'Stable within one report ("f1", "f2", and so on). Use it in fix requests.'
+        path: {type: [string, 'null']}
+        vulnerability_type: {$ref: '#/components/schemas/VulnerabilityType'}
+        severity: {$ref: '#/components/schemas/Severity'}
+        confidence: {$ref: '#/components/schemas/Confidence'}
+        evidence_tier: {$ref: '#/components/schemas/EvidenceTier'}
+        sources:
+          type: array
+          items: {type: string}
+          description: Engines that reported this finding. Informational.
+        rule_id: {type: [string, 'null']}
+        cwe: {type: [string, 'null']}
+        line: {type: [integer, 'null'], minimum: 1}
+        evidence:
+          type: string
+          description: The offending line, with secret values masked.
+        description: {type: string}
+        recommendation: {type: string}
+        reference: {type: [string, 'null']}
+
+    SkippedFile:
+      type: object
+      additionalProperties: false
+      required: [path, reason, blocks_pass]
+      properties:
+        path: {type: string}
+        reason:
+          type: string
+          enum: [unsupported_language, file_too_large, binary_or_invalid, empty]
+        blocks_pass:
+          type: boolean
+          description: True for source files. A report that skipped such a file can never be a pass.
+
+    Coverage:
+      type: object
+      additionalProperties: false
+      required: [languages, files_scanned, skipped_files, analyzers_run, analyzers_failed, not_assessable]
+      description: What was and was not checked. Read it before relying on a pass.
+      properties:
+        languages: {type: array, items: {type: string}}
+        files_scanned: {type: array, items: {type: string}}
+        skipped_files: {type: array, items: {$ref: '#/components/schemas/SkippedFile'}}
+        analyzers_run: {type: array, items: {type: string}}
+        analyzers_failed:
+          type: object
+          additionalProperties: {type: string}
+          description: Keyed by "engine@path"; the value is the error.
+        not_assessable:
+          type: array
+          items: {type: string}
+          description: Categories of problem that scanning submitted files cannot reveal.
+
+    Engine:
+      type: object
+      additionalProperties: false
+      required: [role, name]
+      properties:
+        role: {type: string, enum: [analyzer, detector, classifier, corrector]}
+        name: {type: string}
+
+    Provenance:
+      type: object
+      additionalProperties: false
+      required: [contract_version, service_version, policy_version, engines]
+      description: For audit only. Clients must not branch on any value here.
+      properties:
+        contract_version: {type: string}
+        service_version: {type: string}
+        policy_version: {type: string}
+        engines: {type: array, items: {$ref: '#/components/schemas/Engine'}}
+
+    Summary:
+      type: object
+      additionalProperties: false
+      required: [total_findings, critical, high, medium, low, info]
+      properties:
+        total_findings: {type: integer, minimum: 0}
+        critical: {type: integer, minimum: 0}
+        high: {type: integer, minimum: 0}
+        medium: {type: integer, minimum: 0}
+        low: {type: integer, minimum: 0}
+        info: {type: integer, minimum: 0}
+
+    ScanReport:
+      type: object
+      additionalProperties: false
+      required: [status, decision, risk_level, findings, summary, decision_reasons, coverage, provenance, duration_ms]
+      properties:
+        status: {type: string, enum: [completed, failed]}
+        decision: {$ref: '#/components/schemas/Decision'}
+        risk_level:
+          type: string
+          enum: [none, info, low, medium, high, critical]
+          description: The worst severity among findings. It describes the findings, not the safety of the code.
+        findings: {type: array, items: {$ref: '#/components/schemas/Finding'}}
+        summary: {$ref: '#/components/schemas/Summary'}
+        decision_reasons: {type: array, items: {type: string}}
+        coverage: {$ref: '#/components/schemas/Coverage'}
+        provenance: {$ref: '#/components/schemas/Provenance'}
+        duration_ms: {type: integer, minimum: 0}
+      examples:
+        - status: completed
+          decision: block
+          risk_level: high
+          findings:
+            - id: f1
+              path: app/deploy.py
+              vulnerability_type: command_injection
+              severity: high
+              confidence: high
+              evidence_tier: static_rule
+              sources: [bandit]
+              rule_id: B605
+              cwe: CWE-78
+              line: 6
+              evidence: 'os.system("ping -c 1 " + host)'
+              description: Starting a process with a shell, possible injection detected.
+              recommendation: Avoid shell execution. Pass arguments as a list (no shell=True) and validate or allow-list any user-controlled values.
+              reference: https://bandit.readthedocs.io/en/1.9.4/plugins/b605_start_process_with_a_shell.html
+          summary: {total_findings: 1, critical: 0, high: 1, medium: 0, low: 0, info: 0}
+          decision_reasons:
+            - '1 high-severity, high-confidence finding(s) backed by static analysis (command_injection).'
+          coverage:
+            languages: [python]
+            files_scanned: [app/deploy.py]
+            skipped_files:
+              - {path: README.md, reason: unsupported_language, blocks_pass: false}
+            analyzers_run: [bandit]
+            analyzers_failed: {}
+            not_assessable:
+              - authentication and authorization logic (needs the surrounding application)
+              - data flow across services and files that were not submitted
+              - vulnerabilities in third-party dependencies
+              - deployment, configuration and runtime behavior
+          provenance:
+            contract_version: 1.0.0
+            service_version: 0.1.0
+            policy_version: policy-1
+            engines:
+              - {role: analyzer, name: bandit}
+          duration_ms: 212
+
+    Scan:
+      type: object
+      additionalProperties: false
+      required: [id, status, created_at, completed_at, client_ref, report]
+      properties:
+        id: {type: string}
+        status: {$ref: '#/components/schemas/JobStatus'}
+        created_at: {type: string, format: date-time}
+        completed_at: {type: [string, 'null'], format: date-time}
+        client_ref: {type: [string, 'null']}
+        report:
+          description: Present once status is completed; null before that and when the job failed.
+          oneOf:
+            - {$ref: '#/components/schemas/ScanReport'}
+            - {type: 'null'}
+
+    FixRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        finding_ids:
+          type: array
+          minItems: 1
+          items: {type: string}
+          description: Findings to fix. Omit to fix every finding at medium severity or above.
+        max_patch_lines:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 40
+          description: Largest patch, in added plus removed lines, the service will propose.
+
+    Patch:
+      type: object
+      additionalProperties: false
+      required: [path, finding_ids, unified_diff, explanation]
+      properties:
+        path: {type: string}
+        finding_ids: {type: array, items: {type: string}}
+        unified_diff: {type: string}
+        explanation: {type: string}
+
+    VerificationCheck:
+      type: object
+      additionalProperties: false
+      required: [name, result, detail]
+      properties:
+        name: {type: string, enum: [syntax, rescan, patch_size, scope]}
+        result: {type: string, enum: [pass, fail, skipped]}
+        detail: {type: string}
+
+    VerificationRequest:
+      type: object
+      additionalProperties: false
+      required: [scan_id, files]
+      properties:
+        scan_id: {type: string}
+        client_ref: {type: string, maxLength: 200}
+        files:
+          type: array
+          minItems: 1
+          items: {$ref: '#/components/schemas/InputFile'}
+          description: The corrected version of each file that was changed, as full content.
+
+    Verification:
+      type: object
+      additionalProperties: false
+      required: [id, scan_id, status, created_at, completed_at, outcome, checks, new_findings, resolved_finding_ids]
+      properties:
+        id: {type: string}
+        scan_id: {type: string}
+        status: {$ref: '#/components/schemas/JobStatus'}
+        created_at: {type: string, format: date-time}
+        completed_at: {type: [string, 'null'], format: date-time}
+        outcome:
+          type: [string, 'null']
+          enum: [passed, failed, inconclusive, null]
+          description: |
+            passed: every check passed. failed: a check failed or a new finding appeared.
+            inconclusive: a check could not run (for example the engine was down). Never treat as passed.
+        checks: {type: array, items: {$ref: '#/components/schemas/VerificationCheck'}}
+        new_findings:
+          type: array
+          items: {$ref: '#/components/schemas/Finding'}
+          description: Findings in the corrected code that were not in the original scan.
+        resolved_finding_ids: {type: array, items: {type: string}}
+      examples:
+        - id: ver_01
+          scan_id: scn_01
+          status: completed
+          created_at: '2026-10-15T20:00:00Z'
+          completed_at: '2026-10-15T20:00:03Z'
+          outcome: passed
+          checks:
+            - {name: syntax, result: pass, detail: All corrected files parse.}
+            - {name: rescan, result: pass, detail: The original finding is gone and nothing new at medium or above appeared.}
+            - {name: patch_size, result: pass, detail: "4 changed lines, limit 40."}
+          new_findings: []
+          resolved_finding_ids: [f1]
+
+    Fix:
+      type: object
+      additionalProperties: false
+      required: [id, scan_id, status, created_at, completed_at, patches, verification, applicable, failure_reason]
+      properties:
+        id: {type: string}
+        scan_id: {type: string}
+        status: {$ref: '#/components/schemas/JobStatus'}
+        created_at: {type: string, format: date-time}
+        completed_at: {type: [string, 'null'], format: date-time}
+        patches: {type: array, items: {$ref: '#/components/schemas/Patch'}}
+        verification:
+          description: The service verifies its own patches before reporting them. Null until that finishes.
+          oneOf:
+            - {$ref: '#/components/schemas/Verification'}
+            - {type: 'null'}
+        applicable:
+          type: boolean
+          description: True only when the fix completed and its verification outcome is passed. The service never applies a fix; the caller does, after human approval.
+        failure_reason: {type: [string, 'null']}
+      examples:
+        - id: fix_01
+          scan_id: scn_01
+          status: completed
+          created_at: '2026-10-15T20:00:00Z'
+          completed_at: '2026-10-15T20:00:03Z'
+          patches:
+            - path: app/deploy.py
+              finding_ids: [f1]
+              unified_diff: "--- a/app/deploy.py\n+++ b/app/deploy.py\n@@ -1,6 +1,6 @@\n-import os\n+import subprocess\n \n def ping(host):\n-    os.system(\"ping -c 1 \" + host)\n+    subprocess.run([\"ping\", \"-c\", \"1\", host], check=True)\n"
+              explanation: Replaced the shell call with an argument list so the host cannot inject commands.
+          verification:
+            id: ver_01
+            scan_id: scn_01
+            status: completed
+            created_at: '2026-10-15T20:00:00Z'
+            completed_at: '2026-10-15T20:00:03Z'
+            outcome: passed
+            checks:
+              - {name: syntax, result: pass, detail: All corrected files parse.}
+            new_findings: []
+            resolved_finding_ids: [f1]
+          applicable: true
+          failure_reason: null
+
+    LanguageSupport:
+      type: object
+      additionalProperties: false
+      required: [id, roles]
+      properties:
+        id: {type: string}
+        roles:
+          type: array
+          items: {type: string, enum: [analyzer, detector, classifier, corrector]}
+
+    Capabilities:
+      type: object
+      additionalProperties: false
+      required: [contract_version, service_version, policy_version, languages, limits, retention_hours]
+      properties:
+        contract_version: {type: string}
+        service_version: {type: string}
+        policy_version: {type: string}
+        languages: {type: array, items: {$ref: '#/components/schemas/LanguageSupport'}}
+        limits:
+          type: object
+          additionalProperties: false
+          required: [max_files, max_file_bytes, max_total_bytes, max_wait_seconds]
+          properties:
+            max_files: {type: integer, minimum: 1}
+            max_file_bytes: {type: integer, minimum: 1}
+            max_total_bytes: {type: integer, minimum: 1}
+            max_wait_seconds: {type: integer, minimum: 1}
+        retention_hours: {type: integer, minimum: 0}
+      examples:
+        - contract_version: 1.0.0
+          service_version: 0.1.0
+          policy_version: policy-1
+          languages:
+            - {id: python, roles: [analyzer, detector]}
+          limits: {max_files: 50, max_file_bytes: 200000, max_total_bytes: 1000000, max_wait_seconds: 30}
+          retention_hours: 24
+
+    Readiness:
+      type: object
+      additionalProperties: false
+      required: [status, checks]
+      properties:
+        status: {type: string, enum: [ready, not_ready]}
+        checks:
+          type: object
+          additionalProperties: {type: string, enum: [ok, failing]}
+      examples:
+        - status: ready
+          checks: {job_store: ok, analyzers: ok}
+
+    Problem:
+      type: object
+      additionalProperties: false
+      required: [type, title, status, code]
+      description: An error, shaped after RFC 9457. Branch on `code`, which is stable; `title` and `detail` are for people.
+      properties:
+        type: {type: string}
+        title: {type: string}
+        status: {type: integer, minimum: 400, maximum: 599}
+        detail: {type: string}
+        code:
+          type: string
+          enum:
+            - invalid_request
+            - unsupported_language
+            - payload_too_large
+            - unauthorized
+            - forbidden
+            - not_found
+            - idempotency_conflict
+            - rate_limited
+            - provider_unavailable
+            - internal_error
+        request_id: {type: string}
+      examples:
+        - type: about:blank
+          title: Unsupported language
+          status: 422
+          detail: "language 'cobol' is not supported (supported: python)"
+          code: unsupported_language
+          request_id: req_01
