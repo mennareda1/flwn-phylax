@@ -40,7 +40,7 @@ import sys
 from typing import Callable
 
 from security_service.adapters.bandit import BanditAnalyzer
-from security_service.adapters.secrets import SecretsAnalyzer
+from security_service.adapters.secrets_check import SecretsAnalyzer
 from security_service.adapters.llm_detector import LLMDetector
 from benchmark.cases_python import CASES
 from benchmark.run_benchmark import run, score

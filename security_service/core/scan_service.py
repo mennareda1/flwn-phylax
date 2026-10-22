@@ -8,7 +8,7 @@ ScanService: the core entry point behind POST /v1/scans.
 
 Pipeline: prepare files (limits, language, skips) -> run each engine on each file -> tag
 findings with their file -> merge rule and model findings that agree -> assign ids -> decide
--> build the report with coverage and provenance. Submitted code is never executed.
+-> build the resecretsport with coverage and provenance. Submitted code is never executed.
 Engine failures become SCAN_FAILED, never a silent PASS.
 """
 
@@ -18,7 +18,7 @@ import time
 from dataclasses import replace
 
 from security_service.adapters.bandit import BanditAnalyzer
-from security_service.adapters.secrets import SecretsAnalyzer
+from security_service.adapters.secrets_check import SecretsAnalyzer
 from security_service.core.decision import decide, decide_nothing_scanned
 from security_service.core.files import (
     InvalidScanInput,

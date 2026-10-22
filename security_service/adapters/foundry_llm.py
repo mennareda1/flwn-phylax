@@ -37,8 +37,10 @@ class FoundryLLM:
     ):
         self.deployment = deployment
         self.name = f"foundry:{deployment}"
-        self._endpoint = endpoint or os.getenv("FOUNDRY_ENDPOINT", "")
-        self._api_key = api_key or os.getenv("FOUNDRY_API_KEY", "")
+        # An explicit argument always wins, even an empty one; the environment is only a fallback
+        # for "not given" (None). This matches the Decision-1 adapter.
+        self._endpoint = endpoint if endpoint is not None else os.getenv("FOUNDRY_ENDPOINT", "")
+        self._api_key = api_key if api_key is not None else os.getenv("FOUNDRY_API_KEY", "")
         self._client = client
 
     def _get_client(self) -> Any:
@@ -92,11 +94,22 @@ def demo() -> None:
     except ValueError as exc:
         assert "empty" in str(exc)
 
+    # Missing configuration must raise even when REAL variables are set in the environment (an explicit
+    # empty value beats the environment), so this check passes no matter what the terminal holds.
+    saved = {k: os.environ.get(k) for k in ("FOUNDRY_ENDPOINT", "FOUNDRY_API_KEY")}
     try:
-        FoundryLLM("x", endpoint="", api_key="").complete_json("s", "u")
-        raise AssertionError("missing config must raise")
-    except RuntimeError as exc:
-        assert "FOUNDRY_ENDPOINT" in str(exc)
+        os.environ["FOUNDRY_ENDPOINT"] = "https://leak.services.ai.azure.com"
+        os.environ["FOUNDRY_API_KEY"] = "leak-key"
+        try:
+            FoundryLLM("x", endpoint="", api_key="").complete_json("s", "u")
+            raise AssertionError("missing config must raise")
+        except RuntimeError as exc:
+            assert "FOUNDRY_ENDPOINT" in str(exc)
+        # ...while "not given" does fall back to the environment
+        assert FoundryLLM("x")._endpoint == "https://leak.services.ai.azure.com" and FoundryLLM("x")._api_key == "leak-key"
+    finally:
+        for key, value in saved.items():
+            os.environ.pop(key, None) if value is None else os.environ.__setitem__(key, value)
 
     print("adapters.foundry_llm OK: request shape, empty-content and missing-config handling (fake SDK only)")
 

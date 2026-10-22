@@ -18,11 +18,11 @@ import sys
 CHECKS = [
     "security_service.ports.llm",
     "security_service.ports.classifier",
-    "security_service.ports.corrector",
+    "security_service.ports.corrector",#
     "security_service.adapters.llm_clients",
     "security_service.adapters.foundry_llm",
     "security_service.adapters.fakes",
-    "security_service.adapters.secrets",
+    "security_service.adapters.secrets_check",
     "security_service.adapters.decision1",
     "security_service.adapters.llm_detector",
     "security_service.core.redaction",
