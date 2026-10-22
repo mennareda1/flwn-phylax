@@ -15,8 +15,10 @@ Engine failures become SCAN_FAILED, never a silent PASS.
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 
 from security_service.adapters.bandit import BanditAnalyzer
+from security_service.adapters.secrets import SecretsAnalyzer
 from security_service.core.decision import decide, decide_nothing_scanned
 from security_service.core.files import (
     InvalidScanInput,
@@ -46,32 +48,55 @@ from security_service.version import CONTRACT_VERSION, POLICY_VERSION, SERVICE_V
 __all__ = ["ScanService", "InvalidScanInput", "PayloadTooLarge", "UnsupportedLanguage", "SourceFile", "merge_corroborated"]
 
 
-def merge_corroborated(findings: list[Finding]) -> list[Finding]:
-    """Fold a model finding into a rule finding of the same type on the same (or adjacent) line.
+def _rule_backed(finding: Finding) -> bool:
+    return finding.evidence_tier in (EvidenceTier.STATIC_RULE, EvidenceTier.CORROBORATED)
 
-    One issue reported by both a rule and a model becomes a single CORROBORATED finding listing
-    both sources, instead of two near-duplicate entries. Call it per file.
-    """
-    static = [f for f in findings if f.evidence_tier == EvidenceTier.STATIC_RULE]
+
+def _same_issue(a: Finding, b: Finding) -> bool:
+    if a.vulnerability_type != b.vulnerability_type:
+        return False
+    if a.line is None or b.line is None or abs(a.line - b.line) > 1:
+        return False
+    if set(a.sources) & set(b.sources):
+        return False            # one engine reporting twice is not corroboration
+    if _rule_backed(a) and _rule_backed(b):
+        return True             # two independent rule engines agree
+    if _rule_backed(a) or _rule_backed(b):
+        rule, model = (a, b) if _rule_backed(a) else (b, a)
+        # A model that claims MORE than the rule does stands on its own, so its concern is not
+        # silently absorbed; and it can never lift a rule finding's severity through a merge.
+        return model.severity.rank <= rule.severity.rank
+    return False                # two model findings are not corroboration
+
+
+def _combine(a: Finding, b: Finding) -> Finding:
+    rules = [f for f in (a, b) if _rule_backed(f)]
+    base = max(rules, key=lambda f: f.severity.rank)     # severity and confidence come from rules only
+    other = b if base is a else a
+    base.sources = base.sources + [source for source in other.sources if source not in base.sources]
+    base.evidence_tier = EvidenceTier.CORROBORATED
+    if _rule_backed(other):
+        if other.confidence.rank > base.confidence.rank:
+            base.confidence = other.confidence
+        base.cwe = base.cwe or other.cwe
+    return base
+
+
+def merge_corroborated(findings: list[Finding]) -> list[Finding]:
+    """Fold findings that two independent engines report for the same issue (same type, same or
+    adjacent line) into one CORROBORATED finding listing both sources. Call it per file.
+
+    Rule engines agreeing merge. A rule and a model merge only when the model claims no more than
+    the rule, and the merged finding keeps the rule's severity and confidence. Two models never
+    merge, and one engine's repeated findings never merge."""
     merged: list[Finding] = []
     for finding in findings:
-        if finding.evidence_tier != EvidenceTier.MODEL_SUSPICION:
+        for index, existing in enumerate(merged):
+            if _same_issue(existing, finding):
+                merged[index] = _combine(existing, finding)
+                break
+        else:
             merged.append(finding)
-            continue
-        twin = next(
-            (s for s in static
-             if s.vulnerability_type == finding.vulnerability_type
-             and s.line is not None and finding.line is not None
-             and abs(s.line - finding.line) <= 1),
-            None,
-        )
-        if twin is None:
-            merged.append(finding)
-            continue
-        twin.evidence_tier = EvidenceTier.CORROBORATED
-        for source in finding.sources:
-            if source not in twin.sources:
-                twin.sources.append(source)
     return merged
 
 
@@ -90,7 +115,7 @@ class ScanService:
         strict_coverage: bool = True,
         limits: Limits | None = None,
     ):
-        self._analyzers: list[Analyzer] = analyzers if analyzers is not None else [BanditAnalyzer()]
+        self._analyzers: list[Analyzer] = analyzers if analyzers is not None else [BanditAnalyzer(), SecretsAnalyzer()]
         # True: if any analyzer fails and nothing else was found, the result is SCAN_FAILED
         # (a PASS needs full coverage). False: a PASS may stand when an analyzer such as the
         # LLM is down, with the reduced coverage stated.
@@ -209,7 +234,7 @@ class _StubAnalyzer:
             error = None
         elif self._fail_on is not None:
             error = f"cannot analyze {self._fail_on}"
-        findings = [Finding(**{**f.__dict__}) for f in self._findings]   # fresh copies per call
+        findings = [replace(f, sources=list(f.sources)) for f in self._findings]   # independent copies per call
         return AnalyzerResult(analyzer=self.name, findings=findings if error is None else [], error=error)
 
 
@@ -257,6 +282,31 @@ def demo() -> None:
     merged = both.scan([SourceFile("a.py", "x"), SourceFile("b.py", "y")])
     assert len(merged.findings) == 2     # one per file, each corroborated, not four
     assert all(f.evidence_tier == EvidenceTier.CORROBORATED and f.sources == ["rules", "fake-model"] for f in merged.findings)
+
+    # rule engines agreeing merge into ONE corroborated finding that keeps the higher severity;
+    # one engine reporting twice does not merge
+    twice = ScanService([_StubAnalyzer("bandit", [finding(vtype="hardcoded_credentials", sev=Severity.LOW, conf=Confidence.MEDIUM, line=3, src="bandit")]),
+                         _StubAnalyzer("secrets", [finding(vtype="hardcoded_credentials", sev=Severity.MEDIUM, conf=Confidence.MEDIUM, line=3, src="secrets")])])
+    agreed = twice.scan_snippet("x")
+    assert len(agreed.findings) == 1 and agreed.findings[0].severity == Severity.MEDIUM
+    assert agreed.findings[0].evidence_tier == EvidenceTier.CORROBORATED and sorted(agreed.findings[0].sources) == ["bandit", "secrets"]
+    assert agreed.decision == Decision.REVIEW_REQUIRED                       # LOW alone would have passed
+    dup = ScanService([_StubAnalyzer("bandit", [finding(line=2, src="bandit"), finding(line=2, src="bandit")])])
+    assert len(dup.scan_snippet("x").findings) == 2
+
+    # a model can never lift a rule finding's severity or confidence through a merge...
+    low_rule = finding(sev=Severity.LOW, conf=Confidence.LOW, src="rules", line=4)
+    hot_model = finding(tier=EvidenceTier.MODEL_SUSPICION, sev=Severity.CRITICAL, conf=Confidence.HIGH, line=4, src="fake-model")
+    assert [f.evidence_tier for f in merge_corroborated([low_rule, hot_model])] == [EvidenceTier.STATIC_RULE, EvidenceTier.MODEL_SUSPICION]
+    unmerged = ScanService([_StubAnalyzer("rules", [low_rule]), _StubAnalyzer("model", [hot_model])]).scan_snippet("x")
+    assert len(unmerged.findings) == 2 and unmerged.decision == Decision.REVIEW_REQUIRED   # its concern stands, but it cannot block
+    mild_model = finding(tier=EvidenceTier.MODEL_SUSPICION, sev=Severity.LOW, conf=Confidence.HIGH, line=4, src="fake-model")
+    kept = merge_corroborated([finding(sev=Severity.MEDIUM, conf=Confidence.LOW, src="rules", line=4), mild_model])
+    assert len(kept) == 1 and kept[0].severity == Severity.MEDIUM and kept[0].confidence == Confidence.LOW   # the model did not raise confidence
+
+    # two models never merge into a "corroborated" (rule-backed) finding
+    two_models = merge_corroborated([finding(tier=EvidenceTier.MODEL_SUSPICION, src="m1", line=2), finding(tier=EvidenceTier.MODEL_SUSPICION, src="m2", line=2)])
+    assert len(two_models) == 2 and all(f.evidence_tier == EvidenceTier.MODEL_SUSPICION for f in two_models)
 
     # a model-only finding never blocks
     lone = ScanService([_StubAnalyzer("model", [finding(tier=EvidenceTier.MODEL_SUSPICION, sev=Severity.CRITICAL, vtype="ssrf")])])

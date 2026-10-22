@@ -22,6 +22,8 @@ CHECKS = [
     "security_service.adapters.llm_clients",
     "security_service.adapters.foundry_llm",
     "security_service.adapters.fakes",
+    "security_service.adapters.secrets",
+    "security_service.adapters.decision1",
     "security_service.adapters.llm_detector",
     "security_service.core.redaction",
     "security_service.core.files",

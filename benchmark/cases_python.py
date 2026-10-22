@@ -17,8 +17,9 @@ Never train a model on these cases; they are the held-out test.
 from __future__ import annotations
 
 
-def _case(case_id: str, kind: str, category: str, note: str, code: str) -> dict:
-    return {"id": case_id, "kind": kind, "category": category, "note": note, "code": code.strip("\n") + "\n"}
+def _case(case_id: str, kind: str, category: str, note: str, code: str, group: str = "base") -> dict:
+    return {"id": case_id, "kind": kind, "category": category, "note": note,
+            "code": code.strip("\n") + "\n", "group": group}
 
 
 CASES: list[dict] = [
@@ -336,6 +337,66 @@ def test_addition():
     assert 1 + 1 == 2
 '''),
 ]
+
+
+BASE_CASES = list(CASES)   # the original 41 cases, kept as a fixed reference set for before/after comparisons
+
+# Added in session 1 for the secrets check. They were written AFTER the check's heuristics were
+# designed, so they are regression guards and false-alarm probes, not independent evidence.
+_SV1 = "secrets_v1"
+SECRET_CASES: list[dict] = [
+    _case("cred-aws-key", "vulnerable", "hardcoded_credentials", "cloud access key in its documented format", '''
+import boto3
+
+AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE"
+
+def s3():
+    return boto3.client("s3", aws_access_key_id=AWS_ACCESS_KEY_ID)
+''', _SV1),
+    _case("cred-github-token", "vulnerable", "hardcoded_credentials", "GitHub token in its documented format", '''
+import requests
+
+GITHUB_TOKEN = "ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+
+def repos():
+    return requests.get("https://api.github.com/user/repos", headers={"Authorization": "token " + GITHUB_TOKEN}, timeout=10)
+''', _SV1),
+    _case("cred-dict-password", "vulnerable", "hardcoded_credentials", "password literal inside a config dict", '''
+DB_CONFIG = {"host": "db", "user": "admin", "password": "hunter22"}
+''', _SV1),
+    _case("cred-private-key", "vulnerable", "hardcoded_credentials", "private key pasted into the source", '''
+PRIVATE_KEY = """-----BEGIN RSA PRIVATE KEY-----
+MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu
+-----END RSA PRIVATE KEY-----"""
+''', _SV1),
+    _case("cred-header-name", "lookalike", "hardcoded_credentials", "credential-looking NAME that holds a header name", '''
+API_KEY_HEADER = "X-Api-Key"
+
+def headers(key):
+    return {API_KEY_HEADER: key}
+''', _SV1),
+    _case("cred-env-var-name", "lookalike", "hardcoded_credentials", "holds the NAME of an environment variable, not a secret", '''
+import os
+
+PASSWORD_ENV_VAR = "DB_PASSWORD"
+
+def password():
+    return os.environ[PASSWORD_ENV_VAR]
+''', _SV1),
+    _case("cred-secret-path", "lookalike", "hardcoded_credentials", "path to a secret in a vault, not the secret", '''
+SECRET_PATH = "prod/db/credentials"
+''', _SV1),
+    _case("cred-version-string", "lookalike", "hardcoded_credentials", "a date under a credential-looking name", '''
+API_KEY_VERSION = "2024-01-01"
+''', _SV1),
+    _case("cred-getenv-empty", "fixed", "hardcoded_credentials", "secret read from the environment with an empty default", '''
+import os
+
+API_TOKEN = os.getenv("API_TOKEN", "")
+''', _SV1),
+]
+
+CASES = BASE_CASES + SECRET_CASES
 
 
 def summary() -> str:

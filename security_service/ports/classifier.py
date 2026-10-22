@@ -1,16 +1,26 @@
 """
 security_service/ports/classifier.py
 
-Port: typed-question classification, the role a decision model such as Jev plays.
+Port: typed-question classification, the role a decision model such as Microsoft-Decision-1 plays.
 
 The core asks a set of named questions about one piece of code and gets probabilities back. It
 never sees a provider's wire format: an adapter maps these types to the vendor's API and back.
 Rules for any adapter:
   - answers must come back keyed by the question ids that were sent;
-  - `model` must be the exact versioned model id that answered (never an alias like "latest"),
-    so every result can be traced and confidence thresholds can be tuned against one version;
+  - `model` must be the exact versioned model id that answered (never an alias like "latest"; for
+    Microsoft-Decision-1 that is the model name plus the version chosen when the deployment was
+    created, for example "Microsoft-Decision-1@1"), so every result can be traced and confidence
+    thresholds can be tuned against one version;
   - the provider's own limits (context size, rate limits) are the adapter's problem, surfaced as
-    exceptions or via max_state_tokens, never as a change to this interface.
+    exceptions or via max_state_tokens, never as a change to this interface;
+  - failures are raised as the ClassifierError family below, never returned as partial answers,
+    and never carry the submitted code or a credential in their message.
+
+Failure meanings (the scan service treats every ClassifierError as a failed engine, so a scan can
+fail closed but never silently pass):
+  ClassifierUnavailable  trouble that outlasted the adapter's retries (timeouts, rate limits, 5xx)
+  ClassifierRejected     the provider refused the request (bad key, bad question); retrying won't help
+  StateTooLarge          the code does not fit one question; the caller must chunk it first
 
 A classifier's answers are a SIGNAL. The decision policy (core/decision.py) keeps its veto until
 the classifier passes the promotion test on the benchmark.
@@ -22,6 +32,22 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 MAX_CHOICE_OPTIONS = 255
+
+
+class ClassifierError(RuntimeError):
+    """Base class for every classifier failure."""
+
+
+class ClassifierUnavailable(ClassifierError):
+    """Transient trouble that outlasted the adapter's retries."""
+
+
+class ClassifierRejected(ClassifierError):
+    """The provider refused the request; retrying will not help."""
+
+
+class StateTooLarge(ClassifierError):
+    """The code does not fit in one question; chunk it before asking."""
 
 
 @dataclass(frozen=True)
@@ -110,15 +136,15 @@ def demo() -> None:
 
     good = ClassifierResult(
         {"shell": Answer("yes_no", probability=0.92), "kind": Answer("choice", choice="none", probabilities={"sqli": 0.1, "none": 0.9}, confidence=0.8)},
-        model="jev-1.13.0")
+        model="Microsoft-Decision-1@1")
     validate_result([q_yes, q_pick], good)
 
     broken = {
-        "missing answer": ClassifierResult({"shell": good.answers["shell"]}, "jev-1.13.0"),
-        "alias instead of version": ClassifierResult(good.answers, "jev-latest"),
-        "probability out of range": ClassifierResult({**good.answers, "shell": Answer("yes_no", probability=1.4)}, "jev-1.13.0"),
-        "option not offered": ClassifierResult({**good.answers, "kind": Answer("choice", choice="xss")}, "jev-1.13.0"),
-        "wrong kind": ClassifierResult({**good.answers, "shell": Answer("choice", choice="none")}, "jev-1.13.0"),
+        "missing answer": ClassifierResult({"shell": good.answers["shell"]}, "Microsoft-Decision-1@1"),
+        "alias instead of version": ClassifierResult(good.answers, "decision-latest"),
+        "probability out of range": ClassifierResult({**good.answers, "shell": Answer("yes_no", probability=1.4)}, "Microsoft-Decision-1@1"),
+        "option not offered": ClassifierResult({**good.answers, "kind": Answer("choice", choice="xss")}, "Microsoft-Decision-1@1"),
+        "wrong kind": ClassifierResult({**good.answers, "shell": Answer("choice", choice="none")}, "Microsoft-Decision-1@1"),
     }
     for label, result in broken.items():
         try:
@@ -126,7 +152,9 @@ def demo() -> None:
             raise AssertionError(f"expected rejection: {label}")
         except ValueError:
             pass
-    print("ports.classifier OK: question and reply validation, exact model versions required")
+    assert issubclass(ClassifierUnavailable, ClassifierError) and issubclass(ClassifierRejected, ClassifierError)
+    assert issubclass(StateTooLarge, ClassifierError) and issubclass(ClassifierError, RuntimeError)
+    print("ports.classifier OK: question and reply validation, exact model versions required, failure family defined")
 
 
 if __name__ == "__main__":

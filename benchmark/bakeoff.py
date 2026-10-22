@@ -3,7 +3,7 @@ benchmark/bakeoff.py
 
 Compares models on the SAME benchmark cases, with the same prompt, parser,
 evidence check and decision policy, so the only thing that differs is the
-model. "Bandit only" is always the first row, as the reference point.
+model. "rules only" (Bandit plus the secrets check) is always the first row, as the reference point.
 
 Run from the repo root.
 
@@ -40,6 +40,7 @@ import sys
 from typing import Callable
 
 from security_service.adapters.bandit import BanditAnalyzer
+from security_service.adapters.secrets import SecretsAnalyzer
 from security_service.adapters.llm_detector import LLMDetector
 from benchmark.cases_python import CASES
 from benchmark.run_benchmark import run, score
@@ -70,12 +71,12 @@ def run_bakeoff(
     cases = cases or CASES
     results: dict[str, dict] = {}
 
-    base = score(run(ScanService([BanditAnalyzer()]), cases))
-    results["bandit only"] = {**base, "halluc": None, "avg_s": None, "p95_s": None, "error": None}
+    base = score(run(ScanService([BanditAnalyzer(), SecretsAnalyzer()]), cases))
+    results["rules only"] = {**base, "halluc": None, "avg_s": None, "p95_s": None, "error": None}
 
     for label, make_llm in candidates.items():
         detector = LLMDetector(make_llm(), runs=runs, min_agreement=min_agreement)
-        totals = score(run(ScanService([BanditAnalyzer(), detector]), cases))
+        totals = score(run(ScanService([BanditAnalyzer(), SecretsAnalyzer(), detector]), cases))
         proposed = detector.totals["proposed"]
         results[label] = {
             **totals,
@@ -130,11 +131,11 @@ def selftest() -> None:
     results = run_bakeoff({"oracle (scripted)": lambda: CallableLLM("oracle", _oracle),
                            "noisy (scripted)": lambda: CallableLLM("noisy", _noisy)}, out=lines.append)
     print("\n".join(lines))
-    base, oracle, noisy = results["bandit only"], results["oracle (scripted)"], results["noisy (scripted)"]
+    base, oracle, noisy = results["rules only"], results["oracle (scripted)"], results["noisy (scripted)"]
 
-    assert oracle["found"] == oracle["vuln"] == 19, oracle            # misses covered by the model
-    assert oracle["alarmed"] == 17, oracle                            # +4 alarms; the two LOW-severity cases stay quiet
-    assert oracle["false_alarms"] == base["false_alarms"] == 1        # an honest model adds no false alarms
+    assert oracle["found"] == oracle["vuln"], oracle                  # the model covers every category the rules miss
+    assert oracle["alarmed"] == base["alarmed"] + 3, (oracle, base)   # +3: path traversal, SSRF, template injection (the secrets check already caught the API key)
+    assert oracle["false_alarms"] == base["false_alarms"]             # an honest model adds no false alarms
     assert oracle["failed"] == 0 and oracle["halluc"] == 0.0
 
     assert noisy["halluc"] == 1.0                                     # every proposed finding was invented...

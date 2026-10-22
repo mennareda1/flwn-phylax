@@ -103,6 +103,13 @@ def print_scoreboard(rows: list[dict]) -> None:
     if failed:
         print(f"scans that FAILED (should be 0 on valid code)     : {failed}")
 
+    base_rows = [r for r in rows if r["case"].get("group", "base") == "base"]
+    if len(base_rows) != len(rows):
+        b = score(base_rows)
+        print(f"\n=== the original {len(base_rows)} cases only (comparable with earlier runs) ===")
+        print(f"flagged with the right category: {_pct(b['found'], b['vuln'])}   "
+              f"alarmed: {_pct(b['alarmed'], b['vuln'])}   false alarms: {_pct(b['false_alarms'], b['neg'])}")
+
 
 if __name__ == "__main__":
     print_scoreboard(run())
