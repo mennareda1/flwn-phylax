@@ -1,196 +1,526 @@
 """
-security_service/core/decision.py
+security_service/adapters/decision1.py
 
-The decision policy: turns findings and coverage into PASS / REVIEW_REQUIRED / BLOCK /
-SCAN_FAILED. Pure Python, no tools, no model calls, on purpose. The policy must be
-explainable and testable, so no model is ever asked "is this safe?".
+Classifier adapter for Microsoft-Decision-1 on Microsoft Foundry.
 
-Rules (thresholds below are the knobs; bump POLICY_VERSION in version.py when they change):
-  - BLOCK only on a rule-backed finding that is high severity AND high confidence.
-    A model-only finding can never block.
-  - REVIEW_REQUIRED for any other rule-backed finding at medium severity or above, or a
-    model-only finding at medium or above.
-  - PASS when nothing reaches the review threshold, which means "nothing found by the checks
-    that ran on the files that were scanned", never "safe".
-  - A SOURCE file that was not scanned (unsupported language, too large, corrupt) makes a
-    would-be PASS into REVIEW_REQUIRED. The scan did run, but a human must know it was partial.
-  - SCAN_FAILED when no analyzer completed on files that were attempted, or when an analyzer
-    failed and the rest found nothing (a PASS needs full coverage).
-  - Nothing to scan (no source files at all) is a PASS that says so explicitly; source files that
-    could not be scanned are REVIEW_REQUIRED.
-Flwn treats review_required and scan_failed alike: never a pass, human review required.
+What it does: sends one piece of code (the "state") plus named yes/no or pick-one questions to
+    POST <foundry-resource-endpoint>/providers/microsoft/v1/systemone
+and returns typed answers with probabilities, in the shape the classifier port defines.
+
+Configuration (constructor arguments win; from_env() reads the environment):
+    FOUNDRY_ENDPOINT      the resource host, e.g. https://<resource>.services.ai.azure.com (the full
+                          .../providers/microsoft/v1/systemone URL also works; the path is stripped)
+    FOUNDRY_API_KEY       sent as the `api-key` header
+    DECISION1_AUTH        "key" (default) or "entra". Entra uses azure-identity's DefaultAzureCredential
+                          (sign in first with `az login`) and sends a Bearer token; needs
+                          `pip install azure-identity`. You can also pass your own token_provider.
+    DECISION1_DEPLOYMENT  the deployment name you chose in Foundry (default "decision-1"); it is what
+                          the request's `model` field carries
+    DECISION1_MODEL_VERSION  the model version chosen at deployment (default "1"); reported in every
+                          result as "Microsoft-Decision-1@<version>", never an alias
+
+Behavior worth knowing:
+  - Secrets are masked inside this adapter before anything is sent (core/redaction.py), as the last
+    line of defense at the boundary where code leaves the system. Masking is idempotent.
+  - Only transient failures are retried (HTTP 408, 429, 500, 502, 503, 504 and network errors), up
+    to 3 attempts, honoring Retry-After (capped at 10 s). Anything else fails at once.
+  - Errors never contain the submitted code or any credential.
+  - No new dependency: it uses urllib. The network call is injectable, so tests need no network.
+
+CHECKED AGAINST MICROSOFT'S PAGE (Deploy and use Microsoft-Decision-1 in Microsoft Foundry, updated
+2026-10-09): the endpoint path, the request shape (model = the DEPLOYMENT name, state, questions keyed
+by name, each noul / choice / score with instructions and criteria), both authentication methods
+(Entra ID bearer token, or an api-key header), and the error causes for 400, 401, 403, 404, 422, 429.
+The page also shows that a choice answer carries `type` and `choice`.
+
+NOT YET RUN AGAINST A REAL DEPLOYMENT. The page does not show the full reply, so these are inferred
+and parsed tolerantly: the key holding a noul probability, the key holding per-option probabilities,
+and the names inside `usage`. The first real reply settles them: run `python -m tests.live_decision1`.
+The page states no input limit or rate limit; max_state_tokens below is a cautious guess.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import math
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from typing import Any, Callable
 
-from security_service.core.schema import (
-    Confidence,
-    Decision,
-    EvidenceTier,
-    Finding,
-    Severity,
+from security_service.core.redaction import redact_secrets
+from security_service.ports.classifier import (
+    Answer,
+    ClassifierError,
+    ClassifierRejected,
+    ClassifierResult,
+    ClassifierUnavailable,
+    Question,
+    StateTooLarge,
+    validate_questions,
+    validate_result,
 )
 
-BLOCK_MIN_SEVERITY = Severity.HIGH
-BLOCK_MIN_CONFIDENCE = Confidence.HIGH
-REVIEW_MIN_SEVERITY = Severity.MEDIUM
+MODEL_NAME = "Microsoft-Decision-1"
+SYSTEMONE_PATH = "/providers/microsoft/v1/systemone"
+RETRY_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+MAX_RETRY_WAIT_SECONDS = 10.0
+_ENDPOINT_SUFFIXES = ("/providers/microsoft/v1/systemone", "/providers/microsoft/v1", "/openai/v1", "/openai", "/models")
 
-TOOL_BACKED = (EvidenceTier.STATIC_RULE, EvidenceTier.CORROBORATED)
-
-
-@dataclass(frozen=True)
-class DecisionResult:
-    decision: Decision
-    reasons: tuple[str, ...]
+Transport = Callable[[str, dict, bytes, float], "tuple[int, dict, bytes]"]
 
 
-def _types(findings: list[Finding]) -> str:
-    return ", ".join(sorted({f.vulnerability_type for f in findings}))
+class _TransportFailure(Exception):
+    """A network-level failure (no HTTP response). Carries only the error's class name."""
 
 
-def decide(
-    findings: list[Finding],
-    analyzers_ok: list[str],
-    analyzers_failed: dict[str, str],
-    strict_coverage: bool = True,
-    skipped_blocking: int = 0,
-    notes: tuple[str, ...] = (),
-) -> DecisionResult:
-    if not analyzers_ok:
-        reasons = ["No analyzer completed successfully."]
-        reasons += [f"{name}: {error}" for name, error in analyzers_failed.items()]
-        return DecisionResult(Decision.SCAN_FAILED, tuple(reasons) + notes)
-
-    tool = [f for f in findings if f.evidence_tier in TOOL_BACKED]
-    model = [f for f in findings if f.evidence_tier == EvidenceTier.MODEL_SUSPICION]
-
-    blockers = [
-        f for f in tool
-        if f.severity.rank >= BLOCK_MIN_SEVERITY.rank
-        and f.confidence.rank >= BLOCK_MIN_CONFIDENCE.rank
-    ]
-    tool_review = [f for f in tool if f.severity.rank >= REVIEW_MIN_SEVERITY.rank]
-    model_review = [f for f in model if f.severity.rank >= REVIEW_MIN_SEVERITY.rank]
-
-    if blockers:
-        decision = Decision.BLOCK
-        reasons = [
-            f"{len(blockers)} high-severity, high-confidence finding(s) backed by "
-            f"static analysis ({_types(blockers)})."
-        ]
-    elif tool_review:
-        decision = Decision.REVIEW_REQUIRED
-        reasons = [
-            f"{len(tool_review)} static-analysis finding(s) at medium severity or "
-            f"above need a human look ({_types(tool_review)})."
-        ]
-    elif model_review:
-        decision = Decision.REVIEW_REQUIRED
-        reasons = [
-            f"{len(model_review)} finding(s) rest on model suspicion alone "
-            f"({_types(model_review)}); a model alone never blocks."
-        ]
-    else:
-        decision = Decision.PASS
-        reasons = [
-            "Nothing reached the review threshold within the checks that ran. "
-            "This is not a guarantee the code is secure."
-        ]
-
-    if skipped_blocking:
-        message = f"{skipped_blocking} source file(s) were not scanned, so coverage is incomplete."
-        if decision == Decision.PASS:
-            decision = Decision.REVIEW_REQUIRED
-            reasons = [message + " A pass needs every source file scanned."]
-        else:
-            reasons.append(message)
-
-    if analyzers_failed:
-        failed = "; ".join(f"{name}: {error}" for name, error in analyzers_failed.items())
-        if decision == Decision.PASS and strict_coverage:
-            return DecisionResult(
-                Decision.SCAN_FAILED,
-                (f"Some analyzers failed ({failed}), so a PASS cannot be issued.",) + notes,
-            )
-        reasons.append(f"Coverage is reduced because some analyzers failed ({failed}).")
-
-    return DecisionResult(decision, tuple(reasons) + notes)
+def _urllib_transport(url: str, headers: dict, body: bytes, timeout: float) -> tuple[int, dict, bytes]:
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, {k.lower(): v for k, v in response.headers.items()}, response.read()
+    except urllib.error.HTTPError as error:
+        return error.code, {k.lower(): v for k, v in error.headers.items()}, error.read()
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        raise _TransportFailure(type(error).__name__) from None
 
 
-def decide_nothing_scanned(skipped_blocking: int, notes: tuple[str, ...] = ()) -> DecisionResult:
-    """No file was analyzed at all (every file was skipped). Not the same as a failed scan."""
-    if skipped_blocking:
-        return DecisionResult(
-            Decision.REVIEW_REQUIRED,
-            (f"{skipped_blocking} source file(s) could not be scanned; nothing was checked.",) + notes,
+def normalize_endpoint(endpoint: str) -> str:
+    """The resource host, without a trailing slash or an API path someone pasted along with it."""
+    cleaned = endpoint.strip().rstrip("/")
+    for suffix in _ENDPOINT_SUFFIXES:
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].rstrip("/")
+    return cleaned
+
+
+ENTRA_SCOPE = "https://cognitiveservices.azure.com/.default"
+
+
+def azure_token_provider(credential: Any | None = None) -> Callable[[], str]:
+    """A bearer-token function for Microsoft Entra ID, the method Microsoft recommends.
+
+    `credential` is anything with get_token(scope).token (tests pass a fake). By default it uses
+    azure-identity's DefaultAzureCredential, which caches tokens, so calling this per request is fine."""
+    if credential is None:
+        try:
+            from azure.identity import DefaultAzureCredential   # optional: pip install azure-identity
+        except ImportError:
+            raise ClassifierError("Entra authentication needs the azure-identity package: pip install azure-identity") from None
+        credential = DefaultAzureCredential()
+    return lambda: credential.get_token(ENTRA_SCOPE).token
+
+
+def _number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+class Decision1Classifier:
+    role = "classifier"
+    name = "microsoft-decision-1"
+    # Microsoft's page gives about 32K tokens of input; keep headroom for the questions themselves.
+    max_state_tokens = 30_000
+
+    def __init__(
+        self,
+        deployment: str = "decision-1",
+        model_version: str = "1",
+        endpoint: str | None = None,
+        api_key: str | None = None,
+        token_provider: Callable[[], str] | None = None,
+        timeout: float = 20.0,
+        max_attempts: int = 3,
+        redact: bool = True,
+        transport: Transport | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+    ):
+        self._deployment = deployment
+        self._model_version = model_version
+        self._endpoint = normalize_endpoint(endpoint if endpoint is not None else os.getenv("FOUNDRY_ENDPOINT", ""))
+        self._api_key = api_key if api_key is not None else os.getenv("FOUNDRY_API_KEY", "")
+        self._token_provider = token_provider
+        self._timeout = timeout
+        self._max_attempts = max(1, max_attempts)
+        self._redact = redact
+        self._transport: Transport = transport or _urllib_transport
+        self._sleep = sleep
+        self.last_raw: dict | None = None   # the last parsed reply (answers and usage only); for debugging and the live test
+
+    @classmethod
+    def from_env(cls, **overrides: Any) -> "Decision1Classifier":
+        if os.getenv("DECISION1_AUTH", "key").strip().lower() == "entra" and "token_provider" not in overrides:
+            overrides["token_provider"] = azure_token_provider()   # built only when needed: it imports azure-identity
+        return cls(
+            deployment=os.getenv("DECISION1_DEPLOYMENT", "decision-1"),
+            model_version=os.getenv("DECISION1_MODEL_VERSION", "1"),
+            **overrides,
         )
-    return DecisionResult(
-        Decision.PASS,
-        ("No source files to scan, so nothing was checked. This is not a guarantee about the change.",) + notes,
-    )
+
+    # ------------------------------------------------------------------ public
+
+    def classify(self, state: str, questions: list[Question]) -> ClassifierResult:
+        payload = self.build_request(state, questions)
+        return self._parse(self._post(payload), questions)
+
+    def build_request(self, state: str, questions: list[Question]) -> bytes:
+        """The exact bytes that will be sent: validated, masked and size-checked. Raises before any network call."""
+        validate_questions(questions)
+        if not self._endpoint or not (self._api_key or self._token_provider):
+            raise ClassifierError("FOUNDRY_ENDPOINT and either FOUNDRY_API_KEY or a token provider are required")
+
+        text = redact_secrets(state)[0] if self._redact else state
+        if math.ceil(len(text) / 3) > self.max_state_tokens:   # rough and cautious: about 3 characters per token
+            raise StateTooLarge(f"code is too large for one question (limit about {self.max_state_tokens} tokens); chunk it first")
+
+        body = {
+            "model": self._deployment,
+            "state": text,
+            "questions": {q.id: self._question_body(q) for q in questions},
+        }
+        return json.dumps(body).encode("utf-8")
+
+    def send(self, payload: bytes) -> bytes:
+        """Post a request built by build_request, with retries; returns the raw reply bytes."""
+        return self._post(payload)
+
+    # ------------------------------------------------------------------ request
+
+    @staticmethod
+    def _question_body(question: Question) -> dict:
+        if question.kind == "yes_no":
+            return {"type": "noul", "instructions": question.instructions}
+        return {"type": "choice", "instructions": question.instructions, "criteria": dict(question.options or {})}
+
+    def _headers(self) -> dict:
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self._token_provider is not None:
+            headers["Authorization"] = f"Bearer {self._token_provider()}"
+        else:
+            headers["api-key"] = self._api_key
+        return headers
+
+    def _post(self, payload: bytes) -> bytes:
+        url = self._endpoint + SYSTEMONE_PATH
+        last, last_status = "no attempt made", None
+        for attempt in range(1, self._max_attempts + 1):
+            reply_headers: dict = {}
+            try:
+                status, reply_headers, raw = self._transport(url, self._headers(), payload, self._timeout)
+            except _TransportFailure as failure:
+                last = f"network error ({failure})"
+            else:
+                if status < 400:
+                    return raw
+                if status not in RETRY_STATUSES:
+                    raise self._rejected(status, raw)
+                last, last_status = f"HTTP {status}", status
+            if attempt < self._max_attempts:
+                self._sleep(self._delay(attempt, reply_headers))
+        hint = "; the deployment's rate limit was exceeded: add capacity or lower the request rate" if last_status == 429 else ""
+        raise ClassifierUnavailable(f"{MODEL_NAME} unavailable after {self._max_attempts} attempts (last: {last}){hint}")
+
+    @staticmethod
+    def _delay(attempt: int, headers: dict) -> float:
+        retry_after = str(headers.get("retry-after", "")).strip()
+        if retry_after.isdigit():
+            return min(float(retry_after), MAX_RETRY_WAIT_SECONDS)
+        return 0.5 * 2 ** (attempt - 1)
+
+    _HINTS = {
+        400: "the request has an invalid question type or shape",
+        401: "the credential is missing, invalid or expired",
+        403: "the identity has no access to the deployment; check its role assignment",
+        404: "the endpoint or API path is wrong; use the resource endpoint from the deployment details page",
+        422: "the deployment name or a question definition is not supported; the request's model must be the DEPLOYMENT name",
+    }
+
+    @staticmethod
+    def _rejected(status: int, raw: bytes) -> ClassifierRejected:
+        hint = Decision1Classifier._HINTS.get(status)
+        suffix = f": {hint}" if hint else ""
+        if status in (401, 403):
+            return ClassifierRejected(f"authentication failed (HTTP {status}){suffix}")
+        code = ""
+        try:
+            error = json.loads(raw).get("error")
+            if isinstance(error, dict) and isinstance(error.get("code"), str) and len(error["code"]) <= 60:
+                code = f", code {error['code']}"
+        except (ValueError, AttributeError):
+            pass
+        return ClassifierRejected(f"request rejected by the provider (HTTP {status}{code}){suffix}")
+
+    # ------------------------------------------------------------------ reply
+
+    def _parse(self, raw: bytes, questions: list[Question]) -> ClassifierResult:
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            raise ClassifierError("provider reply was not valid JSON") from None
+        answers_raw = data.get("answers") if isinstance(data, dict) else None
+        if not isinstance(answers_raw, dict):
+            raise ClassifierError("provider reply has no 'answers' object")
+
+        answers = {}
+        for question in questions:
+            if question.id not in answers_raw:
+                raise ClassifierError(f"provider reply is missing the answer for question {question.id!r}")
+            answers[question.id] = self._parse_answer(question, answers_raw[question.id])
+
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        tokens = _number(usage.get("input_tokens", usage.get("prompt_tokens")))
+        result = ClassifierResult(answers, f"{MODEL_NAME}@{self._model_version}", int(tokens or 0))
+        try:
+            validate_result(questions, result)
+        except ValueError as problem:
+            raise ClassifierError(f"provider reply failed validation: {problem}") from None
+        self.last_raw = {"answers": answers_raw, "usage": usage, "model": data.get("model")}
+        return result
+
+    @staticmethod
+    def _parse_answer(question: Question, item: Any) -> Answer:
+        expected = "noul" if question.kind == "yes_no" else "choice"
+        if isinstance(item, dict) and item.get("type") not in (None, expected):
+            raise ClassifierError(f"answer for {question.id!r} has type {item.get('type')!r}, expected {expected!r}")
+
+        if question.kind == "yes_no":
+            if isinstance(item, dict):
+                value = next((n for n in (_number(item.get(k)) for k in ("noul", "probability", "value")) if n is not None), None)
+                if value is None and isinstance(item.get("probabilities"), dict):
+                    value = _number(item["probabilities"].get("true"))
+            else:
+                value = _number(item)
+            if value is None or not 0.0 <= value <= 1.0:
+                raise ClassifierError(f"answer for {question.id!r} has no probability between 0 and 1")
+            return Answer("yes_no", probability=value)
+
+        if not isinstance(item, dict):
+            raise ClassifierError(f"answer for {question.id!r} is not an object")
+        raw_probabilities = item.get("probabilities") if isinstance(item.get("probabilities"), dict) else (
+            item.get("probability") if isinstance(item.get("probability"), dict) else None)
+        probabilities = None
+        if raw_probabilities is not None:
+            probabilities = {str(k): _number(v) for k, v in raw_probabilities.items()}
+            if any(v is None or not 0.0 <= v <= 1.0 for v in probabilities.values()):
+                raise ClassifierError(f"answer for {question.id!r} has an invalid probability")
+        choice = item.get("choice")
+        if choice is None and probabilities:
+            choice = max(probabilities, key=probabilities.get)
+        if not isinstance(choice, str) or choice not in (question.options or {}):
+            raise ClassifierError(f"answer for {question.id!r} chose an option that was not offered")
+        return Answer("choice", choice=choice, probabilities=probabilities, confidence=_number(item.get("confidence")))
 
 
-def _finding(severity, confidence, tier=EvidenceTier.STATIC_RULE, vtype="command_injection") -> Finding:
-    return Finding(
-        vulnerability_type=vtype, severity=severity, confidence=confidence,
-        evidence_tier=tier, sources=["demo"], rule_id="X1", cwe=None, line=1,
-        evidence="x", description="d", recommendation="r",
-    )
-
+# ---------------------------------------------------------------------- self-test
 
 def demo() -> None:
-    """Assert-based self-check, same convention as the other services (no pytest)."""
-    H, M, L = Severity.HIGH, Severity.MEDIUM, Severity.LOW
-    hc, mc = Confidence.HIGH, Confidence.MEDIUM
-    ok, failed = ["a"], {}
+    KEY = "test-key-0123456789"
+    SECRET_STATE = 'DB_PASSWORD = "SuperSecret123!"\nimport os\nos.system("ping " + host)\n'
+    URL = "https://res.services.ai.azure.com/providers/microsoft/v1/systemone"
+    questions = [
+        Question("secret", "yes_no", "Does the code contain a hardcoded password, key or token?"),
+        Question("worst", "choice", "What is the most serious problem?",
+                 {"hardcoded_secret": "a secret in the source", "command_injection": "shell built from input", "none": "nothing", "cannot_tell": "unclear"}),
+    ]
+    good = {"answers": {"secret": {"noul": 0.97},
+                        "worst": {"choice": "command_injection", "confidence": 0.8,
+                                  "probabilities": {"hardcoded_secret": 0.15, "command_injection": 0.8, "none": 0.02, "cannot_tell": 0.03}}},
+            "usage": {"input_tokens": 61}}
 
-    assert decide([], ok, failed).decision == Decision.PASS
+    class Net:
+        """Scripted network: a list of (status, headers, body) or an Exception to raise, consumed in order."""
 
-    # BLOCK needs rule-backed + high severity + high confidence
-    assert decide([_finding(H, hc)], ok, failed).decision == Decision.BLOCK
-    assert decide([_finding(Severity.CRITICAL, hc, EvidenceTier.CORROBORATED)], ok, failed).decision == Decision.BLOCK
-    assert decide([_finding(H, mc)], ok, failed).decision == Decision.REVIEW_REQUIRED
-    assert decide([_finding(M, hc)], ok, failed).decision == Decision.REVIEW_REQUIRED
+        def __init__(self, script):
+            self.script, self.calls = list(script), []
 
-    # a model alone can never block, however severe it claims to be
-    model_high = _finding(Severity.CRITICAL, hc, EvidenceTier.MODEL_SUSPICION)
-    assert decide([model_high], ok, failed).decision == Decision.REVIEW_REQUIRED
-    assert decide([_finding(M, hc, EvidenceTier.MODEL_SUSPICION)], ok, failed).decision == Decision.REVIEW_REQUIRED
+        def __call__(self, url, headers, body, timeout):
+            self.calls.append({"url": url, "headers": headers, "body": body, "timeout": timeout})
+            step = self.script.pop(0) if len(self.script) > 1 else self.script[0]
+            if isinstance(step, Exception):
+                raise step
+            status, hdrs, payload = step
+            return status, hdrs, payload if isinstance(payload, bytes) else json.dumps(payload).encode()
 
-    # low severity alone does not trigger review
-    assert decide([_finding(L, hc)], ok, failed).decision == Decision.PASS
+    def build(script, **kw):
+        net = Net(script)
+        sleeps: list[float] = []
+        clf = Decision1Classifier(endpoint="https://res.services.ai.azure.com", api_key=KEY, transport=net, sleep=sleeps.append, **kw)
+        return clf, net, sleeps
 
-    # nothing ran -> SCAN_FAILED, never PASS
-    assert decide([], [], {"a": "boom"}).decision == Decision.SCAN_FAILED
+    def fails(exc_type, fn):
+        try:
+            fn()
+        except exc_type as caught:
+            text = str(caught)
+            assert KEY not in text and "SuperSecret123" not in text and "ping" not in text, f"leak in error: {text}"
+            return caught
+        raise AssertionError(f"expected {exc_type.__name__}")
 
-    # partial failure: PASS is downgraded; a real finding keeps its decision
-    assert decide([], ["a"], {"b": "timeout"}).decision == Decision.SCAN_FAILED
-    partial = decide([_finding(H, hc)], ["a"], {"b": "timeout"})
-    assert partial.decision == Decision.BLOCK and any("reduced" in r for r in partial.reasons)
+    # 1. success: request shape, headers, parsing, version-stamped model
+    clf, net, _ = build([(200, {}, good)])
+    result = clf.classify(SECRET_STATE, questions)
+    call = net.calls[0]
+    sent = json.loads(call["body"])
+    assert call["url"] == URL and call["headers"]["api-key"] == KEY and "Authorization" not in call["headers"]
+    assert sent["model"] == "decision-1" and sent["questions"]["secret"] == {"type": "noul", "instructions": questions[0].instructions}
+    assert sent["questions"]["worst"]["type"] == "choice" and sent["questions"]["worst"]["criteria"]["none"] == "nothing"
+    assert result.model == "Microsoft-Decision-1@1" and result.input_tokens == 61
+    assert result.answers["secret"].probability == 0.97 and result.answers["worst"].choice == "command_injection"
+    validate_result(questions, result)
+    assert clf.last_raw["usage"] == {"input_tokens": 61}
 
-    # relaxed coverage lets a PASS stand when an analyzer is down, with the gap stated
-    relaxed = decide([], ["a"], {"b": "timeout"}, strict_coverage=False)
-    assert relaxed.decision == Decision.PASS and any("reduced" in r for r in relaxed.reasons)
-    assert decide([], [], {"a": "x"}, strict_coverage=False).decision == Decision.SCAN_FAILED
+    # 2. secrets are masked before anything is sent
+    assert "SuperSecret123" not in call["body"].decode() and "<REDACTED_SECRET>" in sent["state"] and "os.system" in sent["state"]
+    clf2, net2, _ = build([(200, {}, good)], redact=False)
+    clf2.classify(SECRET_STATE, questions)
+    assert "SuperSecret123" in net2.calls[0]["body"].decode()      # only because masking was switched off here
 
-    # skipped SOURCE files: a would-be PASS becomes REVIEW_REQUIRED; real findings keep their decision
-    skipped = decide([], ok, failed, skipped_blocking=2)
-    assert skipped.decision == Decision.REVIEW_REQUIRED and "2 source file(s)" in skipped.reasons[0]
-    kept = decide([_finding(H, hc)], ok, failed, skipped_blocking=1)
-    assert kept.decision == Decision.BLOCK and any("not scanned" in r for r in kept.reasons)
+    # 3. Entra mode sends a Bearer token and no api-key
+    net3 = Net([(200, {}, good)])
+    Decision1Classifier(endpoint="https://res.services.ai.azure.com", token_provider=lambda: "tok123", transport=net3).classify("x = 1", questions)
+    assert net3.calls[0]["headers"]["Authorization"] == "Bearer tok123" and "api-key" not in net3.calls[0]["headers"]
 
-    # notes are appended to every outcome
-    assert decide([], ok, failed, notes=("n1",)).reasons[-1] == "n1"
-    assert decide([], [], {"a": "x"}, notes=("n2",)).reasons[-1] == "n2"
+    # 4. endpoint normalization
+    for raw in ("https://res.services.ai.azure.com/", "https://res.services.ai.azure.com/openai/v1", "https://res.services.ai.azure.com/models/"):
+        assert normalize_endpoint(raw) == "https://res.services.ai.azure.com", raw
 
-    # nothing scanned at all: no source files -> explicit PASS; unscannable source files -> REVIEW_REQUIRED
-    assert decide_nothing_scanned(0).decision == Decision.PASS
-    assert "nothing was checked" in decide_nothing_scanned(0).reasons[0]
-    assert decide_nothing_scanned(3).decision == Decision.REVIEW_REQUIRED
+    # 5. transient failures are retried, Retry-After is honored, then success
+    clf, net, sleeps = build([(429, {"retry-after": "2"}, b"{}"), (200, {}, good)])
+    clf.classify("x = 1", questions)
+    assert len(net.calls) == 2 and sleeps == [2.0]
+    clf, net, sleeps = build([_TransportFailure("TimeoutError"), (503, {}, b""), (200, {}, good)])
+    clf.classify("x = 1", questions)
+    assert len(net.calls) == 3 and sleeps == [0.5, 1.0]
+    clf, net, sleeps = build([(429, {"retry-after": "999"}, b"")] * 3)
+    fails(ClassifierUnavailable, lambda: clf.classify(SECRET_STATE, questions))
+    assert len(net.calls) == 3 and sleeps == [10.0, 10.0]          # capped; no sleep after the last attempt
+    clf, net, sleeps = build([(500, {}, b"")] * 3)
+    err = fails(ClassifierUnavailable, lambda: clf.classify(SECRET_STATE, questions))
+    assert "3 attempts" in str(err) and "HTTP 500" in str(err)
+    clf, net, sleeps = build([_TransportFailure("ConnectionResetError")] * 3)
+    assert "network error" in str(fails(ClassifierUnavailable, lambda: clf.classify(SECRET_STATE, questions)))
 
-    print("core.decision OK: block/review/pass thresholds, model-only never blocks, failures and skipped source files never PASS")
+    # 6. non-transient failures are not retried and say why, without leaking anything
+    clf, net, _ = build([(401, {}, b'{"error": {"message": "bad key sk-live-EXAMPLE"}}')])
+    err = fails(ClassifierRejected, lambda: clf.classify(SECRET_STATE, questions))
+    assert len(net.calls) == 1 and "HTTP 401" in str(err) and "sk-live" not in str(err)
+    clf, net, _ = build([(400, {}, b'{"error": {"code": "invalid_question", "message": "echo SuperSecret123"}}')])
+    err = fails(ClassifierRejected, lambda: clf.classify(SECRET_STATE, questions))
+    assert "HTTP 400" in str(err) and "invalid_question" in str(err)
+
+    # 7. a reply that does not match the contract is an error, never a partial answer
+    bad_replies = {
+        "not json": b"<html>",
+        "no answers": {"result": 1},
+        "missing question": {"answers": {"secret": {"noul": 0.5}}},
+        "probability above 1": {"answers": {**good["answers"], "secret": {"noul": 1.7}}},
+        "boolean probability": {"answers": {**good["answers"], "secret": {"noul": True}}},
+        "option not offered": {"answers": {**good["answers"], "worst": {"choice": "xss"}}},
+        "choice reply is not an object": {"answers": {**good["answers"], "worst": "none"}},
+        "bad option probability": {"answers": {**good["answers"], "worst": {"choice": "none", "probabilities": {"none": 3}}}},
+    }
+    for label, reply in bad_replies.items():
+        clf, _, _ = build([(200, {}, reply)])
+        fails(ClassifierError, lambda: clf.classify("x = 1", questions))
+
+    # 8. tolerant where the format allows: a bare number, and a choice given only as probabilities
+    lenient = {"answers": {"secret": 0.25, "worst": {"probabilities": {"hardcoded_secret": 0.1, "command_injection": 0.1, "none": 0.7, "cannot_tell": 0.1}}}}
+    clf, _, _ = build([(200, {}, lenient)])
+    result = clf.classify("x = 1", questions)
+    assert result.answers["secret"].probability == 0.25 and result.answers["worst"].choice == "none"
+
+    # 9. size and configuration are checked before any network call
+    clf, net, _ = build([(200, {}, good)])
+    fails(StateTooLarge, lambda: clf.classify("x = 1\n" * 20_000, questions))
+    assert net.calls == []
+    unconfigured = Decision1Classifier(endpoint="", api_key="", transport=Net([(200, {}, good)]))
+    fails(ClassifierError, lambda: unconfigured.classify("x = 1", questions))
+    fails(ValueError, lambda: clf.classify("x = 1", []))             # malformed questions are the caller's bug, not the provider's
+
+    # 11. the full API URL (as copied from the docs or the portal) works as the endpoint: the path is not doubled
+    for pasted in ("https://res.services.ai.azure.com/providers/microsoft/v1/systemone",
+                   "https://res.services.ai.azure.com/providers/microsoft/v1/systemone/"):
+        assert normalize_endpoint(pasted) == "https://res.services.ai.azure.com", pasted
+    net_full = Net([(200, {}, good)])
+    Decision1Classifier(endpoint="https://res.services.ai.azure.com/providers/microsoft/v1/systemone", api_key=KEY,
+                        transport=net_full).classify("x = 1", questions)
+    assert net_full.calls[0]["url"] == URL, net_full.calls[0]["url"]
+
+    # 12. reply shapes: Microsoft's page shows `type` and `choice`; a wrong type is an error, extra shapes are tolerated
+    docs_style = {"model": "microsoft-decision-1", "usage": {"input_tokens": 12},
+                  "answers": {"secret": {"type": "noul", "noul": 0.9},
+                              "worst": {"type": "choice", "choice": "none", "probabilities": {"hardcoded_secret": 0.1, "command_injection": 0.1, "none": 0.7, "cannot_tell": 0.1}}}}
+    clf, _, _ = build([(200, {}, docs_style)])
+    result = clf.classify("x = 1", questions)
+    assert result.answers["secret"].probability == 0.9 and result.answers["worst"].probabilities["none"] == 0.7
+    assert clf.last_raw["model"] == "microsoft-decision-1" and result.model == "Microsoft-Decision-1@1"   # we report the version, the provider reports its own name
+    nested = {"answers": {"secret": {"type": "noul", "probabilities": {"true": 0.8, "false": 0.2}},
+                          "worst": {"type": "choice", "choice": "none", "probability": {"hardcoded_secret": 0.1, "command_injection": 0.1, "none": 0.7, "cannot_tell": 0.1}}}}
+    clf, _, _ = build([(200, {}, nested)])
+    result = clf.classify("x = 1", questions)
+    assert result.answers["secret"].probability == 0.8 and result.answers["worst"].probabilities["none"] == 0.7
+    for label, reply in {
+        "choice answer to a yes/no question": {"answers": {**good["answers"], "secret": {"type": "choice", "choice": "none"}}},
+        "noul answer to a choice question": {"answers": {**good["answers"], "worst": {"type": "noul", "noul": 0.5}}},
+    }.items():
+        clf, _, _ = build([(200, {}, reply)])
+        assert "expected" in str(fails(ClassifierError, lambda: clf.classify("x = 1", questions))), label
+
+    # 13. each error carries Microsoft's documented cause, still without leaking anything
+    for status, needle in ((404, "endpoint or API path"), (422, "DEPLOYMENT name"), (403, "role assignment"),
+                           (400, "invalid question type"), (401, "expired")):
+        clf, net, _ = build([(status, {}, b'{"error": {"message": "echo SuperSecret123"}}')])
+        err = fails(ClassifierRejected, lambda: clf.classify(SECRET_STATE, questions))
+        assert needle in str(err) and f"HTTP {status}" in str(err) and len(net.calls) == 1, (status, str(err))
+    clf, _, _ = build([(429, {}, b"")] * 3)
+    assert "rate limit" in str(fails(ClassifierUnavailable, lambda: clf.classify(SECRET_STATE, questions)))
+
+    # 14. Entra ID: the provider asks for the right scope; Bearer is sent; the key is not needed
+    class FakeCredential:
+        def __init__(self):
+            self.scopes = []
+
+        def get_token(self, scope):
+            self.scopes.append(scope)
+            return type("Token", (), {"token": "entra-token-xyz"})()
+
+    credential = FakeCredential()
+    provider = azure_token_provider(credential)
+    assert provider() == "entra-token-xyz" and credential.scopes == ["https://cognitiveservices.azure.com/.default"]
+    net_entra = Net([(200, {}, good)])
+    Decision1Classifier(endpoint="https://res.services.ai.azure.com", token_provider=provider, transport=net_entra).classify("x = 1", questions)
+    assert net_entra.calls[0]["headers"]["Authorization"] == "Bearer entra-token-xyz" and "api-key" not in net_entra.calls[0]["headers"]
+    saved_ident = sys.modules.get("azure.identity", "absent")
+    sys.modules["azure.identity"] = None                    # simulate the package not being installed, whatever this machine has
+    try:
+        assert "pip install azure-identity" in str(fails(ClassifierError, lambda: azure_token_provider()))
+    finally:
+        if saved_ident == "absent":
+            sys.modules.pop("azure.identity", None)
+        else:
+            sys.modules["azure.identity"] = saved_ident
+
+    # 10. from_env reads the deployment and version
+    saved = {k: os.environ.get(k) for k in ("DECISION1_DEPLOYMENT", "DECISION1_MODEL_VERSION", "DECISION1_AUTH", "FOUNDRY_ENDPOINT", "FOUNDRY_API_KEY")}
+    try:
+        os.environ.update(DECISION1_DEPLOYMENT="my-dec", DECISION1_MODEL_VERSION="2", DECISION1_AUTH="key", FOUNDRY_ENDPOINT="https://r.services.ai.azure.com/", FOUNDRY_API_KEY=KEY)
+        net = Net([(200, {}, good)])
+        from_env = Decision1Classifier.from_env(transport=net)
+        assert from_env.classify("x = 1", questions).model == "Microsoft-Decision-1@2"
+        assert json.loads(net.calls[0]["body"])["model"] == "my-dec" and net.calls[0]["url"].startswith("https://r.services.ai.azure.com/providers/")
+        os.environ["DECISION1_AUTH"] = "entra"
+        os.environ.pop("FOUNDRY_API_KEY", None)             # Entra mode needs no key
+        net = Net([(200, {}, good)])
+        Decision1Classifier.from_env(transport=net, token_provider=lambda: "tok-env").classify("x = 1", questions)
+        assert net.calls[0]["headers"]["Authorization"] == "Bearer tok-env"
+    finally:
+        for key, value in saved.items():
+            os.environ.pop(key, None) if value is None else os.environ.__setitem__(key, value)
+
+    print("adapters.decision1 OK: request shape, masking, retries, documented error causes, full-URL endpoint, Entra auth, strict reply checks, no leaks (mock network only)")
 
 
 if __name__ == "__main__":

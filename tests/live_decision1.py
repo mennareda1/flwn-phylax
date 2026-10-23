@@ -4,13 +4,21 @@ tests/live_decision1.py
 First contact with a REAL Microsoft-Decision-1 deployment. Makes one real call (a tiny fraction of
 a cent) through the same adapter code production will use, then prints what came back.
 
-Set three environment variables in your own terminal (never paste a key into a chat), then run it
-from the repo root.
+Set the variables in your own terminal (never paste a key into a chat), then run it from the repo
+root. FOUNDRY_ENDPOINT may be the resource host or the full .../providers/microsoft/v1/systemone URL.
 
-PowerShell:
+PowerShell, with an API key:
     $env:FOUNDRY_ENDPOINT     = "https://YOUR-RESOURCE.services.ai.azure.com"
     $env:FOUNDRY_API_KEY      = "YOUR-KEY"
-    $env:DECISION1_DEPLOYMENT = "decision-1"        # the deployment name you chose
+    $env:DECISION1_DEPLOYMENT = "YOUR-DEPLOYMENT-NAME"   # the name you chose, NOT "Microsoft-Decision-1"
+    python -m tests.live_decision1
+
+PowerShell, with Microsoft Entra ID (recommended by Microsoft; no key needed):
+    az login
+    pip install azure-identity
+    $env:FOUNDRY_ENDPOINT     = "https://YOUR-RESOURCE.services.ai.azure.com"
+    $env:DECISION1_DEPLOYMENT = "YOUR-DEPLOYMENT-NAME"
+    $env:DECISION1_AUTH       = "entra"
     python -m tests.live_decision1
 
 It prints the state that was actually sent (secrets already masked), the raw reply, and the parsed
@@ -108,7 +116,8 @@ def _selftest() -> int:
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
-    missing = [name for name in ("FOUNDRY_ENDPOINT", "FOUNDRY_API_KEY") if not os.getenv(name)]
+    entra = os.getenv("DECISION1_AUTH", "key").strip().lower() == "entra"
+    missing = [name for name in (("FOUNDRY_ENDPOINT",) if entra else ("FOUNDRY_ENDPOINT", "FOUNDRY_API_KEY")) if not os.getenv(name)]
     if missing:
         print("Set these environment variables first: " + ", ".join(missing) + "\n(see the instructions at the top of this file)")
         sys.exit(2)
