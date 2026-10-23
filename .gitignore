@@ -10,3 +10,5 @@ venv/
 .idea/
 .vscode/
 *.zip
+classifier_eval_report.txt
+classifier_eval_results.json

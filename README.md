@@ -47,6 +47,22 @@ A `.env` file is read only by entry points (`tests.live_decision1`, `security_se
 the HTTP service). Library code and the automated checks never read it, so a real `.env` cannot change
 what a test does.
 
+## Measuring the decision model (step 3)
+
+`python -m benchmark.classifier_eval` sends the 50 benchmark cases to Decision-1 with the security questions
+(one yes/no per vulnerability category, plus a verdict that can say "cannot tell"), compares it with what the
+rules alone catch, and tests whether a comment such as "approved by the security team" talks it out of a true
+finding. Run it in this order:
+
+    python -m benchmark.classifier_eval --limit 3     # a smoke test on 3 cases, first
+    python -m benchmark.classifier_eval               # the full run: about 100 requests, under a cent
+
+It saves `classifier_eval_report.txt` (readable, contains no key) and `classifier_eval_results.json`; both are
+git-ignored. The pass/fail gate is written into the program and was fixed before the first real run: at one
+threshold the model must catch at least 2 vulnerable cases the rules miss, add at most 1 false alarm, and lose at
+most 10% of its catches to the comment. Passing only makes it a signal that asks for human review: a model alone
+never blocks. With 23 vulnerable cases it is a smoke test, not a measure of general accuracy.
+
 ## If a call fails
 
 `python -m security_service.config` shows what the program sees. The live test then prints the reason:
@@ -68,10 +84,10 @@ what a test does.
     security_service/
       config.py                        settings from the environment and .env; `python -m security_service.config`
       version.py                       contract, service and policy versions
-      core/                            stable: schema, decision policy, files, scan service, errors, redaction, patching
+      core/                            stable: schema, decision policy, files, scan service, errors, redaction, patching, questions
       ports/                           stable interfaces: analyzer, llm, classifier, corrector
       adapters/                        swappable: bandit, secrets_check, llm_detector, decision1, foundry_llm, llm_clients, fakes
-    benchmark/                         labeled cases, scoreboard, model bake-off
+    benchmark/                         labeled cases, scoreboard, model bake-off, classifier_eval (the step-3 measurement)
     tests/                             run_all, check_contract, check_transport, check_layout, live_decision1
 
 Rule of thumb: `core/` and `ports/` never change when a provider changes. Only `adapters/` and

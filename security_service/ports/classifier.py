@@ -45,6 +45,10 @@ class ClassifierUnavailable(ClassifierError):
 class ClassifierRejected(ClassifierError):
     """The provider refused the request; retrying will not help."""
 
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status     # the HTTP status when there is one; 400 and 422 mean "this request shape is not accepted"
+
 
 class StateTooLarge(ClassifierError):
     """The code does not fit in one question; chunk it before asking."""
@@ -55,7 +59,8 @@ class Question:
     id: str
     kind: Literal["yes_no", "choice"]
     instructions: str                         # write the exact condition; models read literally
-    options: dict[str, str] | None = None     # choice only: option -> description
+    # choice: option -> description. yes_no: optionally {"true": ..., "false": ...}, which sharpens borderline cases
+    options: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -99,7 +104,10 @@ def validate_questions(questions: list[Question]) -> None:
                 raise ValueError(f"choice question {q.id!r} needs at least two options")
             if len(q.options) > MAX_CHOICE_OPTIONS:
                 raise ValueError(f"choice question {q.id!r} has more than {MAX_CHOICE_OPTIONS} options")
-        elif q.kind != "yes_no" or q.options:
+        elif q.kind == "yes_no":
+            if q.options is not None and (set(q.options) != {"true", "false"} or not all(isinstance(v, str) and v.strip() for v in q.options.values())):
+                raise ValueError(f"yes/no question {q.id!r} may only carry the options 'true' and 'false', each with a description")
+        else:
             raise ValueError(f"question {q.id!r} is malformed")
 
 
@@ -125,6 +133,13 @@ def demo() -> None:
     q_yes = Question("shell", "yes_no", "Does the code pass a variable into a shell command?")
     q_pick = Question("kind", "choice", "Which weakness is most likely?", {"sqli": "SQL injection", "none": "No weakness"})
     validate_questions([q_yes, q_pick])
+    validate_questions([Question("c", "yes_no", "Is it?", {"true": "it is", "false": "it is not"})])     # optional criteria on a yes/no
+    for bad_criteria in ({"true": "only one"}, {"yes": "a", "no": "b"}, {"true": "a", "false": "  "}):
+        try:
+            validate_questions([Question("c", "yes_no", "Is it?", bad_criteria)])
+            raise AssertionError(f"expected rejection of criteria {bad_criteria!r}")
+        except ValueError:
+            pass
 
     for bad in ([], [q_yes, q_yes], [Question("c", "choice", "x", {"only": "one"})],
                 [Question("e", "yes_no", "  ")], [Question("m", "yes_no", "x", {"a": "b"})]):

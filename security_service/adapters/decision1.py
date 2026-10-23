@@ -203,7 +203,10 @@ class Decision1Classifier:
     @staticmethod
     def _question_body(question: Question) -> dict:
         if question.kind == "yes_no":
-            return {"type": "noul", "instructions": question.instructions}
+            body = {"type": "noul", "instructions": question.instructions}
+            if question.options:                                    # optional: spell out what true and false mean
+                body["criteria"] = {"true": question.options["true"], "false": question.options["false"]}
+            return body
         return {"type": "choice", "instructions": question.instructions, "criteria": dict(question.options or {})}
 
     def _headers(self) -> dict:
@@ -254,7 +257,7 @@ class Decision1Classifier:
         hint = Decision1Classifier._HINTS.get(status)
         suffix = f": {hint}" if hint else ""
         if status in (401, 403):
-            return ClassifierRejected(f"authentication failed (HTTP {status}){suffix}")
+            return ClassifierRejected(f"authentication failed (HTTP {status}){suffix}", status=status)
         code = ""
         try:
             error = json.loads(raw).get("error")
@@ -262,7 +265,7 @@ class Decision1Classifier:
                 code = f", code {error['code']}"
         except (ValueError, AttributeError):
             pass
-        return ClassifierRejected(f"request rejected by the provider (HTTP {status}{code}){suffix}")
+        return ClassifierRejected(f"request rejected by the provider (HTTP {status}{code}){suffix}", status=status)
 
     # ------------------------------------------------------------------ reply
 
@@ -502,6 +505,16 @@ def demo() -> None:
     }.items():
         clf, _, _ = build([(200, {}, reply)])
         assert "expected" in str(fails(ClassifierError, lambda: clf.classify("x = 1", questions))), label
+
+    # 16. a yes/no question may carry true/false criteria, which are sent as Microsoft documents; the rejection carries its HTTP status
+    with_criteria = [Question("p", "yes_no", "Is there a problem?", {"true": "There is a problem", "false": "There is none"})]
+    net_c = Net([(200, {}, {"answers": {"p": {"type": "noul", "noul": 0.5}}})])
+    build_c = Decision1Classifier(endpoint="https://res.services.ai.azure.com", api_key=KEY, transport=net_c)
+    build_c.classify("x = 1", with_criteria)
+    assert json.loads(net_c.calls[0]["body"])["questions"]["p"] == {"type": "noul", "instructions": "Is there a problem?", "criteria": {"true": "There is a problem", "false": "There is none"}}
+    for status in (400, 422, 401):
+        clf, _, _ = build([(status, {}, b"{}")])
+        assert fails(ClassifierRejected, lambda: clf.classify("x = 1", questions)).status == status
 
     # 13. each error carries Microsoft's documented cause, still without leaking anything
     for status, needle in ((404, "endpoint or API path"), (422, "DEPLOYMENT name"), (403, "role assignment"),

@@ -223,6 +223,27 @@ def run() -> None:
             assert done.returncode == 0 and "parsed OK" in done.stdout and GOOD_KEY not in done.stdout + done.stderr, done.stdout + done.stderr
             assert "settings from" in done.stdout
 
+            # 11. the evaluation program, end to end against the fake server: settings, 14-question requests with criteria,
+            # injection variants, analysis, and both result files (run in a temp folder, so nothing is written into the repo)
+            work = Path(folder) / "work"
+            work.mkdir()
+            before = len(server.requests)
+            evaluation = subprocess.run([sys.executable, "-m", "benchmark.classifier_eval", "--limit", "3"], cwd=work, capture_output=True,
+                                        text=True, encoding="utf-8", env={**clean, "SECURITY_ENV_FILE": str(env_path), "PYTHONPATH": str(REPO_ROOT)}, timeout=180)
+            assert evaluation.returncode == 0, evaluation.stdout + evaluation.stderr
+            report_file, json_file = work / "classifier_eval_report.txt", work / "classifier_eval_results.json"
+            assert report_file.is_file() and json_file.is_file()
+            report_text = report_file.read_text(encoding="utf-8")
+            assert "SMOKE TEST" in report_text and "VERDICT" in report_text and "RAW SCORES" in report_text
+            assert GOOD_KEY not in evaluation.stdout + evaluation.stderr + report_text + json_file.read_text(encoding="utf-8")
+            sent = server.requests[before:]
+            assert len(sent) >= 3, len(sent)
+            first = sent[0]["body"]
+            assert len(first["questions"]) == 14 and first["questions"]["command_injection"]["criteria"]["true"], list(first["questions"])
+            assert first["questions"]["worst_problem"]["type"] == "choice" and "cannot_tell" in first["questions"]["worst_problem"]["criteria"]
+            assert any(r["body"]["state"].startswith("# Security review") for r in sent)        # the injection variants were sent
+            assert json.loads(json_file.read_text(encoding="utf-8"))["gate"]["verdict"] == "NOT DECIDED"   # three cases can never decide the gate
+
             # ...a variable in the terminal beats the file: a wrong key in the terminal must fail, even though the file has the right one
             override = subprocess.run([sys.executable, "-m", "tests.live_decision1"], cwd=REPO_ROOT, capture_output=True, text=True,
                                       encoding="utf-8", env={**clean, "SECURITY_ENV_FILE": str(env_path), "FOUNDRY_API_KEY": "terminal-wrong-key-123"}, timeout=60)

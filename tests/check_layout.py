@@ -49,6 +49,8 @@ EXPECTED_HOME = {
     "redact_secrets": "security_service/core/redaction.py",
     "prepare_files": "security_service/core/files.py",
     "problem_for": "security_service/core/errors.py",
+    "build_questions": "security_service/core/questions.py",
+    "evaluate": "benchmark/classifier_eval.py",
 }
 NUMBERED_OR_COPY = re.compile(r"\(\d+\)|[ _-]copy\b", re.IGNORECASE)
 BACKUP_SUFFIX = re.compile(r"(\.orig|\.bak|~)$", re.IGNORECASE)
