@@ -18,7 +18,7 @@ import sys
 CHECKS = [
     "security_service.ports.llm",
     "security_service.ports.classifier",
-    "security_service.ports.corrector",#
+    "security_service.ports.corrector",
     "security_service.adapters.llm_clients",
     "security_service.adapters.foundry_llm",
     "security_service.adapters.fakes",

@@ -1,5 +1,5 @@
 """
-security_service/adapters/secrets.py
+security_service/adapters/secrets_check.py
 
 Deterministic secrets check: finds credentials written into source code. No model, no network, no
 license question; it is our own code, built on the same patterns that mask secrets before a model

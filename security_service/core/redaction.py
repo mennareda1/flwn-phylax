@@ -7,7 +7,7 @@ Secret handling shared by two jobs that must agree on what a secret looks like:
      before an evidence line is shown to a user, secrets are replaced with <REDACTED_SECRET>.
      Line count is preserved, so line numbers in a model's answer still match the original.
      Masking is deliberately LIBERAL: a missed secret leaks, a wrongly masked value costs nothing.
-  2. DETECTING (scan_secrets, used by adapters/secrets.py): finding secrets to report to a user.
+  2. DETECTING (scan_secrets, used by adapters/secrets_check.py): finding secrets to report to a user.
      Detection is deliberately CAREFUL: every report becomes an alarm someone must look at, so a
      match is only "strict" (reportable) when the value could plausibly be a real secret. Names,
      header names, environment-variable names, paths, URLs and version strings are not.
