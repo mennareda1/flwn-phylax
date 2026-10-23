@@ -98,7 +98,7 @@ class Handler(BaseHTTPRequestHandler):
             server.flaky_left -= 1
             return self._send(429, {"error": {"code": "TooManyRequests"}}, {"Retry-After": "0"})
         if model == "slow":
-            time.sleep(1.0)
+            time.sleep(3.0)
         return self._send(200, reply_for(body))
 
 
@@ -188,7 +188,7 @@ def run() -> None:
             raise AssertionError("expected ClassifierUnavailable")
         except ClassifierUnavailable as problem:
             assert "network error" in str(problem)
-        assert time.monotonic() - started < 0.9
+        assert time.monotonic() - started < 2.0     # returned at the 0.3 s timeout, not after the server's 3 s stall
         closed = socket.socket()
         closed.bind(("127.0.0.1", 0))
         dead_port = closed.getsockname()[1]

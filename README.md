@@ -67,7 +67,7 @@ what a test does.
       ports/                           stable interfaces: analyzer, llm, classifier, corrector
       adapters/                        swappable: bandit, secrets_check, llm_detector, decision1, foundry_llm, llm_clients, fakes
     benchmark/                         labeled cases, scoreboard, model bake-off
-    tests/                             run_all, check_contract, check_transport, live_decision1
+    tests/                             run_all, check_contract, check_transport, check_layout, live_decision1
 
 Rule of thumb: `core/` and `ports/` never change when a provider changes. Only `adapters/` and
 configuration do. A new provider must pass the port's validation rules and clear the benchmark gate.
