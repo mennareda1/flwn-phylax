@@ -7,15 +7,17 @@ What it does: sends one piece of code (the "state") plus named yes/no or pick-on
     POST <foundry-resource-endpoint>/providers/microsoft/v1/systemone
 and returns typed answers with probabilities, in the shape the classifier port defines.
 
-Configuration (constructor arguments win; from_env() reads the environment):
-    FOUNDRY_ENDPOINT      the resource host, e.g. https://<resource>.services.ai.azure.com
-    FOUNDRY_API_KEY       sent as the `api-key` header; or pass token_provider to use a Microsoft
-                          Entra ID token as a Bearer token instead (scope
-                          https://cognitiveservices.azure.com/.default)
-    DECISION1_DEPLOYMENT  the deployment name you chose in Foundry (default "decision-1"); it is what
-                          the request's `model` field carries
-    DECISION1_MODEL_VERSION  the model version chosen at deployment (default "1"); reported in every
-                          result as "Microsoft-Decision-1@<version>", never an alias
+Configuration comes from security_service.config (environment variables, optionally filled from a
+.env file by the entry point; see .env.example). Build the adapter from it with:
+
+    Decision1Classifier.from_settings(Settings.from_env())      # or simply Decision1Classifier.from_env()
+
+Variables: FOUNDRY_ENDPOINT (or DECISION1_ENDPOINT), FOUNDRY_API_KEY (or DECISION1_API_KEY),
+DECISION1_DEPLOYMENT (the name you chose in Foundry, NOT "Microsoft-Decision-1"), DECISION1_MODEL_VERSION,
+DECISION1_AUTH ("key" or "entra"; Entra needs `pip install azure-identity` and `az login`),
+DECISION1_TIMEOUT, DECISION1_MAX_ATTEMPTS. The endpoint may be the resource host or the full
+.../providers/microsoft/v1/systemone URL; the path is stripped. Constructor arguments always win over
+the environment, even an empty one.
 
 Behavior worth knowing:
   - Secrets are masked inside this adapter before anything is sent (core/redaction.py), as the last
@@ -25,11 +27,16 @@ Behavior worth knowing:
   - Errors never contain the submitted code or any credential.
   - No new dependency: it uses urllib. The network call is injectable, so tests need no network.
 
-NOT YET RUN AGAINST A REAL DEPLOYMENT. The request shape follows what Microsoft documents (a model,
-a state, questions keyed by name, each noul / choice / score with instructions and criteria). The
-reply parsing follows the "System One" format described by third parties (noul: a probability;
-choice: the choice, a probability per option, a confidence). Parsing is deliberately tolerant about
-field names, but the first real reply must be checked: run `python -m tests.live_decision1`.
+CHECKED AGAINST MICROSOFT'S PAGE (Deploy and use Microsoft-Decision-1 in Microsoft Foundry, updated
+2026-10-09): the endpoint path, the request shape (model = the DEPLOYMENT name, state, questions keyed
+by name, each noul / choice / score with instructions and criteria), both authentication methods
+(Entra ID bearer token, or an api-key header), and the error causes for 400, 401, 403, 404, 422, 429.
+The page also shows that a choice answer carries `type` and `choice`.
+
+NOT YET RUN AGAINST A REAL DEPLOYMENT. The page does not show the full reply, so these are inferred
+and parsed tolerantly: the key holding a noul probability, the key holding per-option probabilities,
+and the names inside `usage`. The first real reply settles them: run `python -m tests.live_decision1`.
+The page states no input limit or rate limit; max_state_tokens below is a cautious guess.
 """
 
 from __future__ import annotations
@@ -37,11 +44,13 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
 from typing import Any, Callable
 
+from security_service.config import SYSTEMONE_PATH, Settings, normalize_endpoint   # normalize_endpoint is re-exported
 from security_service.core.redaction import redact_secrets
 from security_service.ports.classifier import (
     Answer,
@@ -56,10 +65,8 @@ from security_service.ports.classifier import (
 )
 
 MODEL_NAME = "Microsoft-Decision-1"
-SYSTEMONE_PATH = "/providers/microsoft/v1/systemone"
 RETRY_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 MAX_RETRY_WAIT_SECONDS = 10.0
-_ENDPOINT_SUFFIXES = ("/openai/v1", "/openai", "/models")
 
 Transport = Callable[[str, dict, bytes, float], "tuple[int, dict, bytes]"]
 
@@ -79,13 +86,21 @@ def _urllib_transport(url: str, headers: dict, body: bytes, timeout: float) -> t
         raise _TransportFailure(type(error).__name__) from None
 
 
-def normalize_endpoint(endpoint: str) -> str:
-    """The resource host, without a trailing slash or an API suffix someone pasted from another setting."""
-    cleaned = endpoint.strip().rstrip("/")
-    for suffix in _ENDPOINT_SUFFIXES:
-        if cleaned.endswith(suffix):
-            cleaned = cleaned[: -len(suffix)].rstrip("/")
-    return cleaned
+ENTRA_SCOPE = "https://cognitiveservices.azure.com/.default"
+
+
+def azure_token_provider(credential: Any | None = None) -> Callable[[], str]:
+    """A bearer-token function for Microsoft Entra ID, the method Microsoft recommends.
+
+    `credential` is anything with get_token(scope).token (tests pass a fake). By default it uses
+    azure-identity's DefaultAzureCredential, which caches tokens, so calling this per request is fine."""
+    if credential is None:
+        try:
+            from azure.identity import DefaultAzureCredential   # optional: pip install azure-identity
+        except ImportError:
+            raise ClassifierError("Entra authentication needs the azure-identity package: pip install azure-identity") from None
+        credential = DefaultAzureCredential()
+    return lambda: credential.get_token(ENTRA_SCOPE).token
 
 
 def _number(value: Any) -> float | None:
@@ -126,12 +141,29 @@ class Decision1Classifier:
         self.last_raw: dict | None = None   # the last parsed reply (answers and usage only); for debugging and the live test
 
     @classmethod
-    def from_env(cls, **overrides: Any) -> "Decision1Classifier":
-        return cls(
-            deployment=os.getenv("DECISION1_DEPLOYMENT", "decision-1"),
-            model_version=os.getenv("DECISION1_MODEL_VERSION", "1"),
-            **overrides,
+    def from_settings(cls, settings: Settings, **overrides: Any) -> "Decision1Classifier":
+        if settings.decision1_auth == "entra" and "token_provider" not in overrides:
+            overrides["token_provider"] = azure_token_provider()   # built only when needed: it imports azure-identity
+        arguments: dict[str, Any] = dict(
+            deployment=settings.decision1_deployment,
+            model_version=settings.decision1_model_version,
+            endpoint=settings.decision1_endpoint,
+            api_key=settings.decision1_api_key,
+            timeout=settings.decision1_timeout,
+            max_attempts=settings.decision1_max_attempts,
         )
+        arguments.update(overrides)
+        return cls(**arguments)
+
+    @classmethod
+    def from_env(cls, **overrides: Any) -> "Decision1Classifier":
+        """Read the process environment only. (A .env file is loaded by entry points, not here.)"""
+        return cls.from_settings(Settings.from_env(), **overrides)
+
+    @property
+    def url(self) -> str:
+        """The exact URL requests go to."""
+        return self._endpoint + SYSTEMONE_PATH
 
     # ------------------------------------------------------------------ public
 
@@ -177,8 +209,8 @@ class Decision1Classifier:
         return headers
 
     def _post(self, payload: bytes) -> bytes:
-        url = self._endpoint + SYSTEMONE_PATH
-        last = "no attempt made"
+        url = self.url
+        last, last_status = "no attempt made", None
         for attempt in range(1, self._max_attempts + 1):
             reply_headers: dict = {}
             try:
@@ -190,10 +222,11 @@ class Decision1Classifier:
                     return raw
                 if status not in RETRY_STATUSES:
                     raise self._rejected(status, raw)
-                last = f"HTTP {status}"
+                last, last_status = f"HTTP {status}", status
             if attempt < self._max_attempts:
                 self._sleep(self._delay(attempt, reply_headers))
-        raise ClassifierUnavailable(f"{MODEL_NAME} unavailable after {self._max_attempts} attempts (last: {last})")
+        hint = "; the deployment's rate limit was exceeded: add capacity or lower the request rate" if last_status == 429 else ""
+        raise ClassifierUnavailable(f"{MODEL_NAME} unavailable after {self._max_attempts} attempts (last: {last}){hint}")
 
     @staticmethod
     def _delay(attempt: int, headers: dict) -> float:
@@ -202,10 +235,20 @@ class Decision1Classifier:
             return min(float(retry_after), MAX_RETRY_WAIT_SECONDS)
         return 0.5 * 2 ** (attempt - 1)
 
+    _HINTS = {
+        400: "the request has an invalid question type or shape",
+        401: "the credential is missing, invalid or expired",
+        403: "the identity has no access to the deployment; check its role assignment",
+        404: "the endpoint or API path is wrong; use the resource endpoint from the deployment details page",
+        422: "the deployment name or a question definition is not supported; the request's model must be the DEPLOYMENT name",
+    }
+
     @staticmethod
     def _rejected(status: int, raw: bytes) -> ClassifierRejected:
+        hint = Decision1Classifier._HINTS.get(status)
+        suffix = f": {hint}" if hint else ""
         if status in (401, 403):
-            return ClassifierRejected(f"authentication failed (HTTP {status}): check the key, token or resource permissions")
+            return ClassifierRejected(f"authentication failed (HTTP {status}){suffix}")
         code = ""
         try:
             error = json.loads(raw).get("error")
@@ -213,7 +256,7 @@ class Decision1Classifier:
                 code = f", code {error['code']}"
         except (ValueError, AttributeError):
             pass
-        return ClassifierRejected(f"request rejected by the provider (HTTP {status}{code})")
+        return ClassifierRejected(f"request rejected by the provider (HTTP {status}{code}){suffix}")
 
     # ------------------------------------------------------------------ reply
 
@@ -239,22 +282,33 @@ class Decision1Classifier:
             validate_result(questions, result)
         except ValueError as problem:
             raise ClassifierError(f"provider reply failed validation: {problem}") from None
-        self.last_raw = {"answers": answers_raw, "usage": usage}
+        self.last_raw = {"answers": answers_raw, "usage": usage, "model": data.get("model")}
         return result
 
     @staticmethod
     def _parse_answer(question: Question, item: Any) -> Answer:
+        expected = "noul" if question.kind == "yes_no" else "choice"
+        if isinstance(item, dict) and item.get("type") not in (None, expected):
+            raise ClassifierError(f"answer for {question.id!r} has type {item.get('type')!r}, expected {expected!r}")
+
         if question.kind == "yes_no":
-            value = _number(item) if not isinstance(item, dict) else _number(item.get("noul", item.get("probability")))
+            if isinstance(item, dict):
+                value = next((n for n in (_number(item.get(k)) for k in ("noul", "probability", "value")) if n is not None), None)
+                if value is None and isinstance(item.get("probabilities"), dict):
+                    value = _number(item["probabilities"].get("true"))
+            else:
+                value = _number(item)
             if value is None or not 0.0 <= value <= 1.0:
                 raise ClassifierError(f"answer for {question.id!r} has no probability between 0 and 1")
             return Answer("yes_no", probability=value)
 
         if not isinstance(item, dict):
             raise ClassifierError(f"answer for {question.id!r} is not an object")
+        raw_probabilities = item.get("probabilities") if isinstance(item.get("probabilities"), dict) else (
+            item.get("probability") if isinstance(item.get("probability"), dict) else None)
         probabilities = None
-        if isinstance(item.get("probabilities"), dict):
-            probabilities = {str(k): _number(v) for k, v in item["probabilities"].items()}
+        if raw_probabilities is not None:
+            probabilities = {str(k): _number(v) for k, v in raw_probabilities.items()}
             if any(v is None or not 0.0 <= v <= 1.0 for v in probabilities.values()):
                 raise ClassifierError(f"answer for {question.id!r} has an invalid probability")
         choice = item.get("choice")
@@ -391,19 +445,104 @@ def demo() -> None:
     fails(ClassifierError, lambda: unconfigured.classify("x = 1", questions))
     fails(ValueError, lambda: clf.classify("x = 1", []))             # malformed questions are the caller's bug, not the provider's
 
-    # 10. from_env reads the deployment and version
-    saved = {k: os.environ.get(k) for k in ("DECISION1_DEPLOYMENT", "DECISION1_MODEL_VERSION", "FOUNDRY_ENDPOINT", "FOUNDRY_API_KEY")}
-    try:
-        os.environ.update(DECISION1_DEPLOYMENT="my-dec", DECISION1_MODEL_VERSION="2", FOUNDRY_ENDPOINT="https://r.services.ai.azure.com/", FOUNDRY_API_KEY=KEY)
-        net = Net([(200, {}, good)])
-        from_env = Decision1Classifier.from_env(transport=net)
-        assert from_env.classify("x = 1", questions).model == "Microsoft-Decision-1@2"
-        assert json.loads(net.calls[0]["body"])["model"] == "my-dec" and net.calls[0]["url"].startswith("https://r.services.ai.azure.com/providers/")
-    finally:
-        for key, value in saved.items():
-            os.environ.pop(key, None) if value is None else os.environ.__setitem__(key, value)
+    # 11. the full API URL (as copied from the docs or the portal) works as the endpoint: the path is not doubled
+    for pasted in ("https://res.services.ai.azure.com/providers/microsoft/v1/systemone",
+                   "https://res.services.ai.azure.com/providers/microsoft/v1/systemone/"):
+        assert normalize_endpoint(pasted) == "https://res.services.ai.azure.com", pasted
+    net_full = Net([(200, {}, good)])
+    Decision1Classifier(endpoint="https://res.services.ai.azure.com/providers/microsoft/v1/systemone", api_key=KEY,
+                        transport=net_full).classify("x = 1", questions)
+    assert net_full.calls[0]["url"] == URL, net_full.calls[0]["url"]
 
-    print("adapters.decision1 OK: request shape, masking, retries, rejection, strict reply checks, no leaks (mock network only)")
+    # 12. reply shapes: Microsoft's page shows `type` and `choice`; a wrong type is an error, extra shapes are tolerated
+    docs_style = {"model": "microsoft-decision-1", "usage": {"input_tokens": 12},
+                  "answers": {"secret": {"type": "noul", "noul": 0.9},
+                              "worst": {"type": "choice", "choice": "none", "probabilities": {"hardcoded_secret": 0.1, "command_injection": 0.1, "none": 0.7, "cannot_tell": 0.1}}}}
+    clf, _, _ = build([(200, {}, docs_style)])
+    result = clf.classify("x = 1", questions)
+    assert result.answers["secret"].probability == 0.9 and result.answers["worst"].probabilities["none"] == 0.7
+    assert clf.last_raw["model"] == "microsoft-decision-1" and result.model == "Microsoft-Decision-1@1"   # we report the version, the provider reports its own name
+    nested = {"answers": {"secret": {"type": "noul", "probabilities": {"true": 0.8, "false": 0.2}},
+                          "worst": {"type": "choice", "choice": "none", "probability": {"hardcoded_secret": 0.1, "command_injection": 0.1, "none": 0.7, "cannot_tell": 0.1}}}}
+    clf, _, _ = build([(200, {}, nested)])
+    result = clf.classify("x = 1", questions)
+    assert result.answers["secret"].probability == 0.8 and result.answers["worst"].probabilities["none"] == 0.7
+    for label, reply in {
+        "choice answer to a yes/no question": {"answers": {**good["answers"], "secret": {"type": "choice", "choice": "none"}}},
+        "noul answer to a choice question": {"answers": {**good["answers"], "worst": {"type": "noul", "noul": 0.5}}},
+    }.items():
+        clf, _, _ = build([(200, {}, reply)])
+        assert "expected" in str(fails(ClassifierError, lambda: clf.classify("x = 1", questions))), label
+
+    # 13. each error carries Microsoft's documented cause, still without leaking anything
+    for status, needle in ((404, "endpoint or API path"), (422, "DEPLOYMENT name"), (403, "role assignment"),
+                           (400, "invalid question type"), (401, "expired")):
+        clf, net, _ = build([(status, {}, b'{"error": {"message": "echo SuperSecret123"}}')])
+        err = fails(ClassifierRejected, lambda: clf.classify(SECRET_STATE, questions))
+        assert needle in str(err) and f"HTTP {status}" in str(err) and len(net.calls) == 1, (status, str(err))
+    clf, _, _ = build([(429, {}, b"")] * 3)
+    assert "rate limit" in str(fails(ClassifierUnavailable, lambda: clf.classify(SECRET_STATE, questions)))
+
+    # 14. Entra ID: the provider asks for the right scope; Bearer is sent; the key is not needed
+    class FakeCredential:
+        def __init__(self):
+            self.scopes = []
+
+        def get_token(self, scope):
+            self.scopes.append(scope)
+            return type("Token", (), {"token": "entra-token-xyz"})()
+
+    credential = FakeCredential()
+    provider = azure_token_provider(credential)
+    assert provider() == "entra-token-xyz" and credential.scopes == ["https://cognitiveservices.azure.com/.default"]
+    net_entra = Net([(200, {}, good)])
+    Decision1Classifier(endpoint="https://res.services.ai.azure.com", token_provider=provider, transport=net_entra).classify("x = 1", questions)
+    assert net_entra.calls[0]["headers"]["Authorization"] == "Bearer entra-token-xyz" and "api-key" not in net_entra.calls[0]["headers"]
+    saved_ident = sys.modules.get("azure.identity", "absent")
+    sys.modules["azure.identity"] = None                    # simulate the package not being installed, whatever this machine has
+    try:
+        assert "pip install azure-identity" in str(fails(ClassifierError, lambda: azure_token_provider()))
+    finally:
+        if saved_ident == "absent":
+            sys.modules.pop("azure.identity", None)
+        else:
+            sys.modules["azure.identity"] = saved_ident
+
+    # 10. settings drive the adapter: deployment, version, timeout, attempts; a pasted full URL works; own endpoint and key win
+    env = {"FOUNDRY_ENDPOINT": "https://r.services.ai.azure.com/providers/microsoft/v1/systemone", "FOUNDRY_API_KEY": KEY,
+           "DECISION1_DEPLOYMENT": "my-dec", "DECISION1_MODEL_VERSION": "2", "DECISION1_TIMEOUT": "5", "DECISION1_MAX_ATTEMPTS": "2"}
+    net = Net([(200, {}, good)])
+    via_settings = Decision1Classifier.from_settings(Settings.from_env(env), transport=net)
+    assert via_settings.classify("x = 1", questions).model == "Microsoft-Decision-1@2"
+    assert json.loads(net.calls[0]["body"])["model"] == "my-dec"
+    assert net.calls[0]["url"] == "https://r.services.ai.azure.com/providers/microsoft/v1/systemone"
+    assert net.calls[0]["timeout"] == 5.0 and net.calls[0]["headers"]["api-key"] == KEY
+    net = Net([(503, {}, b"")])
+    fails(ClassifierUnavailable, lambda: Decision1Classifier.from_settings(Settings.from_env(env), transport=net, sleep=lambda s: None).classify("x = 1", questions))
+    assert len(net.calls) == 2                                  # DECISION1_MAX_ATTEMPTS=2 was honored
+    net = Net([(200, {}, good)])
+    Decision1Classifier.from_settings(Settings.from_env({**env, "DECISION1_ENDPOINT": "https://own.services.ai.azure.com", "DECISION1_API_KEY": "own-key"}), transport=net).classify("x = 1", questions)
+    assert net.calls[0]["url"].startswith("https://own.services.ai.azure.com/") and net.calls[0]["headers"]["api-key"] == "own-key"
+    net = Net([(200, {}, good)])
+    entra_env = {"FOUNDRY_ENDPOINT": "https://r.services.ai.azure.com", "DECISION1_AUTH": "entra"}   # no key at all
+    Decision1Classifier.from_settings(Settings.from_env(entra_env), transport=net, token_provider=lambda: "tok-env").classify("x = 1", questions)
+    assert net.calls[0]["headers"]["Authorization"] == "Bearer tok-env" and "api-key" not in net.calls[0]["headers"]
+
+    # from_env() reads the real process environment: clear every variable the project reads first, so this
+    # check gives the same answer whatever a developer has in their terminal
+    from security_service.config import VARIABLES
+    saved = {name: os.environ.pop(name, None) for name in VARIABLES}
+    try:
+        os.environ.update({"FOUNDRY_ENDPOINT": "https://r.services.ai.azure.com/", "FOUNDRY_API_KEY": KEY, "DECISION1_DEPLOYMENT": "from-process"})
+        net = Net([(200, {}, good)])
+        Decision1Classifier.from_env(transport=net).classify("x = 1", questions)
+        assert json.loads(net.calls[0]["body"])["model"] == "from-process" and net.calls[0]["headers"]["api-key"] == KEY
+    finally:
+        for name in VARIABLES:
+            os.environ.pop(name, None)
+        os.environ.update({name: value for name, value in saved.items() if value is not None})
+
+    print("adapters.decision1 OK: request shape, masking, retries, documented error causes, full-URL endpoint, Entra auth, strict reply checks, no leaks (mock network only)")
 
 
 if __name__ == "__main__":

@@ -28,19 +28,24 @@ CHECKS = [
     "security_service.core.redaction",
     "security_service.core.files",
     "security_service.core.patching",
-    "security_service.core.decision",
+    "security_service.core.policy",
     "security_service.core.errors",
     "security_service.core.scan_service",
+    "security_service.config --selftest",
     "benchmark.cases_python",
     "benchmark.bakeoff",
+    "tests.check_layout",
     "tests.check_contract",
+    "tests.live_decision1 --selftest",
+    "tests.check_transport",
 ]
 
 
 def main() -> int:
     failures = []
-    for module in CHECKS:
-        done = subprocess.run([sys.executable, "-m", module], capture_output=True, text=True, encoding="utf-8")
+    for entry in CHECKS:
+        module = entry.split()[0]                 # an entry may carry a flag, e.g. "tests.live_decision1 --selftest"
+        done = subprocess.run([sys.executable, "-m", *entry.split()], capture_output=True, text=True, encoding="utf-8")
         lines = (done.stdout or "").strip().splitlines()
         summary = next((line for line in reversed(lines) if "OK" in line), lines[-1] if lines else "")
         if done.returncode == 0:

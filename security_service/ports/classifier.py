@@ -22,7 +22,7 @@ fail closed but never silently pass):
   ClassifierRejected     the provider refused the request (bad key, bad question); retrying won't help
   StateTooLarge          the code does not fit one question; the caller must chunk it first
 
-A classifier's answers are a SIGNAL. The decision policy (core/decision.py) keeps its veto until
+A classifier's answers are a SIGNAL. The decision policy (core/policy.py) keeps its veto until
 the classifier passes the promotion test on the benchmark.
 """
 

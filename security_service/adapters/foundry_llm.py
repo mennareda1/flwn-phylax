@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from security_service.config import Settings, normalize_endpoint
 from security_service.ports.llm import parse_json_object
 
 
@@ -43,6 +44,14 @@ class FoundryLLM:
         self._api_key = api_key if api_key is not None else os.getenv("FOUNDRY_API_KEY", "")
         self._client = client
 
+    @classmethod
+    def from_settings(cls, settings: Settings, deployment: str) -> "FoundryLLM":
+        return cls(deployment, endpoint=settings.foundry_endpoint, api_key=settings.foundry_api_key)
+
+    def _base_url(self) -> str:
+        """The chat endpoint. A pasted full URL (for example the Decision-1 one) is reduced to the resource host first."""
+        return f"{normalize_endpoint(self._endpoint)}/models"
+
     def _get_client(self) -> Any:
         if self._client is None:
             if not self._endpoint.strip() or not self._api_key.strip():
@@ -51,7 +60,7 @@ class FoundryLLM:
             from azure.core.credentials import AzureKeyCredential
 
             self._client = ChatCompletionsClient(
-                endpoint=f"{self._endpoint.rstrip('/')}/models",
+                endpoint=self._base_url(),
                 credential=AzureKeyCredential(self._api_key),
             )
         return self._client
@@ -111,9 +120,14 @@ def demo() -> None:
         for key, value in saved.items():
             os.environ.pop(key, None) if value is None else os.environ.__setitem__(key, value)
 
-    print("adapters.foundry_llm OK: request shape, empty-content and missing-config handling (fake SDK only)")
+    # a pasted Decision-1 URL must not leak into the chat endpoint
+    assert FoundryLLM("x", endpoint="https://res.services.ai.azure.com/providers/microsoft/v1/systemone", api_key="k")._base_url() == "https://res.services.ai.azure.com/models"
+    assert FoundryLLM("x", endpoint="https://res.services.ai.azure.com/", api_key="k")._base_url() == "https://res.services.ai.azure.com/models"
+    from_cfg = FoundryLLM.from_settings(Settings.from_env({"FOUNDRY_ENDPOINT": "https://res.services.ai.azure.com/providers/microsoft/v1/systemone", "FOUNDRY_API_KEY": "kk"}), "gpt-6-astra")
+    assert from_cfg._base_url() == "https://res.services.ai.azure.com/models" and from_cfg.name == "foundry:gpt-6-astra"
+
+    print("adapters.foundry_llm OK: request shape, empty-content and missing-config handling, endpoint cleanup (fake SDK only)")
 
 
 if __name__ == "__main__":
     demo()
-    

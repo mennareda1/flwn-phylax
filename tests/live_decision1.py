@@ -4,22 +4,17 @@ tests/live_decision1.py
 First contact with a REAL Microsoft-Decision-1 deployment. Makes one real call (a tiny fraction of
 a cent) through the same adapter code production will use, then prints what came back.
 
-Set the variables in your own terminal (never paste a key into a chat), then run it from the repo
-root. FOUNDRY_ENDPOINT may be the resource host or the full .../providers/microsoft/v1/systemone URL.
+Configure it with a .env file in the repo root (copy .env.example to .env and fill it in), or with
+variables in your terminal. Variables in the terminal win over the file. Check your settings first, with
+no network call, using:  python -m security_service.config
 
-PowerShell, with an API key:
-    $env:FOUNDRY_ENDPOINT     = "https://YOUR-RESOURCE.services.ai.azure.com"
-    $env:FOUNDRY_API_KEY      = "YOUR-KEY"
-    $env:DECISION1_DEPLOYMENT = "YOUR-DEPLOYMENT-NAME"   # the name you chose, NOT "Microsoft-Decision-1"
-    python -m tests.live_decision1
+    FOUNDRY_ENDPOINT      your resource endpoint (the full .../providers/microsoft/v1/systemone URL also works)
+    FOUNDRY_API_KEY       your key (or set DECISION1_AUTH=entra and run `az login` instead)
+    DECISION1_DEPLOYMENT  the deployment name you chose, NOT "Microsoft-Decision-1"
 
-PowerShell, with Microsoft Entra ID (recommended by Microsoft; no key needed):
-    az login
-    pip install azure-identity
-    $env:FOUNDRY_ENDPOINT     = "https://YOUR-RESOURCE.services.ai.azure.com"
-    $env:DECISION1_DEPLOYMENT = "YOUR-DEPLOYMENT-NAME"
-    $env:DECISION1_AUTH       = "entra"
-    python -m tests.live_decision1
+Then, from the repo root:    python -m tests.live_decision1
+
+Never paste a key into a chat or a screenshot, and never commit .env (it is git-ignored).
 
 It prints the state that was actually sent (secrets already masked), the raw reply, and the parsed
 answers. If the adapter cannot read the reply, it still prints the raw reply, because that is
@@ -36,6 +31,7 @@ import sys
 from typing import Callable
 
 from security_service.adapters.decision1 import Decision1Classifier
+from security_service.config import Settings, load_env_file
 from security_service.ports.classifier import ClassifierError, Question
 
 STATE = 'DB_PASSWORD = "SuperSecret123!"\nimport os\n\ndef ping(host):\n    os.system("ping -c 1 " + host)\n'
@@ -60,6 +56,7 @@ def run(classifier: Decision1Classifier, out: Callable[[str], None] = print) -> 
         return 2
     sent = json.loads(payload)
     out(f"deployment: {sent['model']}")
+    out(f"calling: {classifier.url}")
     out("state sent (secrets already masked):\n" + sent["state"])
 
     try:
@@ -116,9 +113,16 @@ def _selftest() -> int:
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
-    entra = os.getenv("DECISION1_AUTH", "key").strip().lower() == "entra"
-    missing = [name for name in (("FOUNDRY_ENDPOINT",) if entra else ("FOUNDRY_ENDPOINT", "FOUNDRY_API_KEY")) if not os.getenv(name)]
-    if missing:
-        print("Set these environment variables first: " + ", ".join(missing) + "\n(see the instructions at the top of this file)")
+    loaded = load_env_file()
+    settings = Settings.from_env()
+    print(f"settings from: {loaded if loaded else 'the terminal environment only (no .env file found)'}")
+    for warning in settings.warnings:
+        print(f"warning: {warning}")
+    problems = settings.problems()
+    if problems:
+        print("Cannot start:")
+        for problem in problems:
+            print(f"  - {problem}")
+        print("Run `python -m security_service.config` to see your settings.")
         sys.exit(2)
-    sys.exit(run(Decision1Classifier.from_env()))
+    sys.exit(run(Decision1Classifier.from_settings(settings)))

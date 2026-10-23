@@ -4,6 +4,9 @@ bandit
 # Optional: only for the Azure Foundry adapter (adapters/foundry_llm.py)
 azure-ai-inference
 
+# Optional: only for Microsoft Entra ID sign-in to Decision-1 (DECISION1_AUTH=entra)
+# azure-identity
+
 # Development and tests: the contract check
 pyyaml
 jsonschema

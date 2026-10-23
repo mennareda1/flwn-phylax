@@ -125,7 +125,7 @@ def demo() -> None:
 
     assert analyzer.analyze("x = 1\n", "python").findings == []
     assert not analyzer.analyze("let a = 1", "javascript").ok
-    print("adapters.secrets OK: six real secrets reported, six lookalikes not, no secret value in any finding, never high confidence")
+    print("adapters.secrets_check OK: six real secrets reported, six lookalikes not, no secret value in any finding, never high confidence")
 
 
 if __name__ == "__main__":
