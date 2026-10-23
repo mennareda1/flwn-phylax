@@ -12,6 +12,10 @@ Rules:
   - Settings.from_env() only reads variables; it does no file or network work.
   - .env is never committed (see .gitignore). .env.example is committed, with placeholders only.
 
+Create your .env, once (it refuses to overwrite one that already exists):
+
+    python -m security_service.config --init
+
 Check your setup without any network call:
 
     python -m security_service.config
@@ -116,6 +120,40 @@ def load_env_file(
         if override or key not in environ:
             environ[key] = value
     return file
+
+
+# ---------------------------------------------------------------------- creating .env (once, never overwriting)
+
+def init_env_file(root: Path | None = None) -> tuple[Path, bool]:
+    """Create .env from .env.example in the repo root, but NEVER overwrite an existing .env.
+    Returns (path, created). Copying the template over .env by hand overwrites silently, which is how
+    a filled-in .env gets wiped; this is the safe way."""
+    root = Path(root) if root else REPO_ROOT
+    target, template = root / ".env", root / ".env.example"
+    if target.exists():
+        return target, False
+    if not template.is_file():
+        raise FileNotFoundError(f"{template} is missing, so there is nothing to copy")
+    target.write_bytes(template.read_bytes())
+    return target, True
+
+
+# ---------------------------------------------------------------------- the committed template
+
+SECRET_NAME_PARTS = ("KEY", "SECRET", "TOKEN", "PASSWORD")
+EXAMPLE_FIX = "Move your values into .env, then restore the template with: git checkout -- .env.example"
+
+
+def example_file_problems(text: str) -> list[str]:
+    """.env.example is committed to a public repository, so it may hold placeholders only. Returns what
+    in it looks like a real value. Variable NAMES are reported, never the values."""
+    found = []
+    for name, value in parse_env_text(text).items():
+        if any(part in name for part in SECRET_NAME_PARTS) and value:
+            found.append(f"{name} has a value in .env.example (secrets belong in .env only)")
+        if name.endswith("ENDPOINT") and value and "YOUR-RESOURCE" not in value.upper():
+            found.append(f"{name} in .env.example is not the YOUR-RESOURCE placeholder (real endpoints belong in .env)")
+    return found
 
 
 # ---------------------------------------------------------------------- settings
@@ -248,6 +286,18 @@ class Settings:
 
 
 def main(argv: list[str]) -> int:
+    if "--init" in argv:
+        try:
+            target, created = init_env_file()
+        except FileNotFoundError as problem:
+            print(problem)
+            return 2
+        if created:
+            print(f"Created {target}\nNow open it with `notepad .env`, fill in FOUNDRY_ENDPOINT, FOUNDRY_API_KEY and DECISION1_DEPLOYMENT, and save.\n"
+                  "You do this once. After that, `python -m security_service.config` checks it, as often as you like.")
+        else:
+            print(f"{target} already exists, so it was NOT touched (your values are safe).\nEdit it with: notepad .env")
+        return 0
     path = None
     if "--env-file" in argv:
         index = argv.index("--env-file")
@@ -261,12 +311,18 @@ def main(argv: list[str]) -> int:
     loaded = load_env_file(path)
     settings = Settings.from_env()
     print(settings.describe(loaded))
-    return 2 if settings.problems() else 0
+    example = REPO_ROOT / ".env.example"
+    exposed = example_file_problems(example.read_text(encoding="utf-8-sig", errors="replace")) if example.is_file() else []
+    for problem in exposed:
+        print(f"WARNING: {problem}. That file is committed to a public repository, so do NOT commit it. {EXAMPLE_FIX}")
+    return 2 if settings.problems() or exposed else 0
 
 
 # ---------------------------------------------------------------------- self-test
 
 def demo() -> None:
+    import tempfile
+
     # --- parsing: every shape a real .env file takes, including Windows line endings
     text = (
         "# a comment\r\n"
@@ -358,6 +414,24 @@ def demo() -> None:
     assert secret not in summary and "32 characters" in summary and ".env" in summary
     assert "NOT SET" in Settings.from_env({}).describe() and "Entra" in Settings.from_env({"DECISION1_AUTH": "entra"}).describe()
 
+    # --- --init creates .env once and never overwrites it
+    with tempfile.TemporaryDirectory() as folder:
+        root = Path(folder)
+        (root / ".env.example").write_text("FOUNDRY_ENDPOINT=https://YOUR-RESOURCE.services.ai.azure.com\n", encoding="ascii")
+        made, created = init_env_file(root)
+        assert created and made == root / ".env" and made.read_text(encoding="ascii").startswith("FOUNDRY_ENDPOINT=")
+        made.write_text("FOUNDRY_ENDPOINT=https://my-real.services.ai.azure.com\nFOUNDRY_API_KEY=my-real-key\n", encoding="ascii")   # the user fills it in
+        again, created_again = init_env_file(root)
+        assert not created_again and again == made
+        assert "my-real-key" in made.read_text(encoding="ascii"), "init must never overwrite a filled-in .env"
+        (root / ".env").unlink()
+        (root / ".env.example").unlink()
+        try:
+            init_env_file(root)
+            raise AssertionError("expected FileNotFoundError when the template is missing")
+        except FileNotFoundError:
+            pass
+
     # --- every variable the project reads is listed (tests clear exactly these names)
     for name in ("FOUNDRY_ENDPOINT", "FOUNDRY_API_KEY", "DECISION1_AUTH", "SCAN_MAX_FILES", ENV_FILE_VAR):
         assert name in VARIABLES
@@ -368,11 +442,19 @@ def demo() -> None:
     example_text = example.read_text(encoding="ascii")
     mentioned = set(re.findall(r"^#?\s*([A-Z][A-Z0-9_]+)=", example_text, re.M))
     assert mentioned == set(VARIABLES), f"variables missing from or unknown to .env.example: {sorted(mentioned ^ set(VARIABLES))}"
+    assert example_file_problems(example_text) == [], (
+        "the committed .env.example holds real values: " + "; ".join(example_file_problems(example_text)) + ". " + EXAMPLE_FIX)
+    clean_text = "FOUNDRY_ENDPOINT=https://YOUR-RESOURCE.services.ai.azure.com\nFOUNDRY_API_KEY=\n# DECISION1_API_KEY=\nDECISION1_DEPLOYMENT=decision-1\n"
+    assert example_file_problems(clean_text) == []
+    secret_value = "9f1c2e77a0b84d5e8a3b6c1d2e4f5a60"
+    leaked = example_file_problems("FOUNDRY_API_KEY=" + secret_value + "\nDECISION1_API_KEY=abc\nFOUNDRY_ENDPOINT=https://aif-real.services.ai.azure.com\n")
+    assert len(leaked) == 3 and all(secret_value not in line for line in leaked)        # names are reported, never values
+    assert example_file_problems("FOUNDRY_API_KEY=\n# FOUNDRY_API_KEY=real-looking-value-123\n") == []     # comments are fine
     unedited = Settings.from_env(parse_env_text(example_text))
     assert unedited.problems(), "the unedited example must not look ready"
     assert any("placeholder" in p for p in unedited.problems()) and any("API key" in p for p in unedited.problems())
 
-    print("config OK: .env parsing (CRLF, BOM, quotes), terminal beats file, endpoint cleanup, placeholders caught, .env.example in sync, secrets never printed")
+    print("config OK: .env parsing (CRLF, BOM, quotes), terminal beats file, endpoint cleanup, placeholders caught, .env.example in sync and free of real values, secrets never printed")
 
 
 if __name__ == "__main__":

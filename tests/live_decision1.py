@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from typing import Callable
 
 from security_service.adapters.decision1 import Decision1Classifier
@@ -59,11 +60,13 @@ def run(classifier: Decision1Classifier, out: Callable[[str], None] = print) -> 
     out(f"calling: {classifier.url}")
     out("state sent (secrets already masked):\n" + sent["state"])
 
+    started = time.perf_counter()
     try:
         raw = classifier.send(payload)
     except ClassifierError as problem:
-        out(f"\nThe call failed: {problem}")
+        out(f"\nThe call failed after {(time.perf_counter() - started) * 1000:.0f} ms: {problem}")
         return 1
+    out(f"\nresponse received in {(time.perf_counter() - started) * 1000:.0f} ms (one call, including the network and any retries)")
     out("\nraw reply:")
     try:
         out(json.dumps(json.loads(raw), indent=2))
@@ -95,6 +98,7 @@ def _selftest() -> int:
     assert run(ok, lines.append) == 0
     text = "\n".join(lines)
     assert "SuperSecret123" not in text and "<REDACTED_SECRET>" in text and "parsed OK" in text and "command_injection" in text
+    assert "response received in" in text and "ms" in text
 
     lines.clear()
     odd = Decision1Classifier(endpoint="https://r.services.ai.azure.com", api_key="k", transport=lambda *a: (200, {}, b'{"results": [1]}'))

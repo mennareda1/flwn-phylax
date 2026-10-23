@@ -9,10 +9,15 @@ everything else can change behind it.
 Run every command from this folder, the one that contains `security_service` and `tests`.
 
     pip install -r requirements.txt
-    Copy-Item .env.example .env          # then open .env and fill in your values (see the table below)
-    python -m security_service.config    # checks your settings, with NO network call
-    python -m tests.live_decision1       # ONE real call to your Decision-1 deployment
-    python -m tests.run_all              # every automated check, one line each
+    python -m security_service.config --init   # ONCE: creates .env from the template (it never overwrites an existing .env)
+    notepad .env                               # fill in your values (see the table below), save, close
+    python -m security_service.config          # checks your settings, with NO network call
+    python -m tests.live_decision1             # ONE real call to your Decision-1 deployment
+    python -m tests.run_all                    # every automated check, one line each
+
+Run the `--init` line only once. Every other line can be repeated as often as you like and never changes
+your settings. (Do not create `.env` by copying the template over it: a copy overwrites silently, which wipes a
+filled-in file. `--init` is the safe way.)
 
 `.env` holds your endpoint and key. It is git-ignored: never commit it, paste it into a chat, or
 screenshot it. `.env.example` is the committed template and contains placeholders only.
@@ -54,7 +59,7 @@ what a test does.
 | `HTTP 422` | The deployment name or a question is not supported | `DECISION1_DEPLOYMENT` must be the deployment name |
 | `rate limit` (429) | The deployment's quota is exceeded | Add capacity, or lower the request rate |
 | `network error` | No connection, firewall, VPN, or timeout | Check the endpoint host and your network |
-| `Cannot start: ...` | A setting is missing or still a placeholder | Edit `.env`, then run the config check again |
+| `Cannot start: ...` or `Problems:` after you filled the file in | Your values were wiped (copying the template over `.env` overwrites it), you edited `.env.example` instead of `.env`, or Notepad saved `.env.txt` | Fill in `.env` again and never re-run the copy; if `.env.example` was edited, `git checkout -- .env.example`; then run the config check |
 
 ## Layout
 
@@ -82,9 +87,11 @@ Built and tested: the core, the ports, the Bandit, secrets-check, LLM-detector a
 adapters, the settings and `.env` support, the benchmark and bake-off, the contract, and an end-to-end
 test of the real network code against a fake server on this machine.
 
-Not yet run against a real model: the LLM detector, the Foundry adapter, and Decision-1 itself (its
-request side is checked against Microsoft's page; its exact reply keys are not shown there, so the
-first real call settles them).
+Run against the real service: Decision-1. One real call on 2026-10-23 confirmed sign-in with an API
+key, the request, the reply format and the parsing (the reply is kept as a regression test). Its
+accuracy on code is not measured yet.
+
+Not yet run against a real model: the LLM detector and the Foundry adapter.
 
 Not built yet: the HTTP service (FastAPI, auth, job store, idempotency, retention), the fix and
 verification services, the security question set and code chunking for the classifier, the classifier
@@ -102,11 +109,15 @@ promotion test, the Astra corrector adapter, and the C++, C# and JS lanes.
   model version chosen at deployment time (reported as `Microsoft-Decision-1@1`), never to an alias. The
   classifier port is unchanged: only its adapter differs from any other provider.
 - Decision-1 was checked against Microsoft's page "Deploy and use Microsoft-Decision-1 in Microsoft
-  Foundry" (updated 2026-10-09): endpoint path, request shape, both auth methods, error causes. Not
-  stated there, so still unverified: the reply keys for a yes/no probability and per-option
-  probabilities, any input limit, and any rate limit. Microsoft's region table lists the model only as
-  Global Standard and Data Zone Standard (no regional type); the US regions show for both, and the
-  Europe rows must be checked in the portal before promising EU-only processing.
+  Foundry" (updated 2026-10-09) and then by a real call (2026-10-23). Confirmed: endpoint path, request
+  shape, API-key sign-in, and the reply format (`noul`, `choice`, `probabilities`, `confidence`, `usage`).
+  Still not shown anywhere: an input-size limit, a rate limit, and any EU data zone. Microsoft's region
+  table lists the model only as Global Standard and Data Zone Standard (no regional type); the US regions
+  show for both, and the Europe rows must be checked in the portal before promising EU-only processing.
+- The classifier sees MASKED code. In the first real call, a password assignment arrived as
+  `DB_PASSWORD = "<REDACTED_SECRET>"` and scored only 0.62 for "contains a hardcoded password", and
+  command injection scored 0.80. So secrets are the job of the deterministic secrets check (which reads the
+  original code locally), and the classifier is used for what rules miss, not for secrets.
 - The Decision-1 adapter masks secrets itself before anything is sent, retries only temporary errors
   (408, 429, 5xx, network), and never puts the code or a credential in an error. Parsing is tolerant
   about field names but strict about meaning: out-of-range probabilities and options that were not

@@ -31,12 +31,18 @@ CHECKED AGAINST MICROSOFT'S PAGE (Deploy and use Microsoft-Decision-1 in Microso
 2026-10-09): the endpoint path, the request shape (model = the DEPLOYMENT name, state, questions keyed
 by name, each noul / choice / score with instructions and criteria), both authentication methods
 (Entra ID bearer token, or an api-key header), and the error causes for 400, 401, 403, 404, 422, 429.
-The page also shows that a choice answer carries `type` and `choice`.
 
-NOT YET RUN AGAINST A REAL DEPLOYMENT. The page does not show the full reply, so these are inferred
-and parsed tolerantly: the key holding a noul probability, the key holding per-option probabilities,
-and the names inside `usage`. The first real reply settles them: run `python -m tests.live_decision1`.
-The page states no input limit or rate limit; max_state_tokens below is a cautious guess.
+CONFIRMED BY A REAL CALL (2026-10-23, API-key sign-in, deployment "decision-1"): the reply is
+    {"model": "microsoft-decision-1",
+     "answers": {"<question>": {"type": "noul",   "noul": <probability>},
+                 "<question>": {"type": "choice", "choice": "<option>", "confidence": <number>,
+                                "probabilities": {"<option>": <probability>, ...}}},
+     "usage": {"input_tokens": <n>, "output_tokens": <n>}}
+That exact reply is kept as a regression test below (REAL_REPLY). Parsing stays tolerant about field
+names, but strict about meaning. `confidence` is not the same number as the top probability.
+
+STILL NOT SHOWN ANYWHERE: an input-size limit and a rate limit (max_state_tokens below is a cautious
+guess), and whether an EU data zone is offered for this model.
 """
 
 from __future__ import annotations
@@ -321,6 +327,29 @@ class Decision1Classifier:
 
 # ---------------------------------------------------------------------- self-test
 
+# A reply from the real service, captured 2026-10-23 from a live call (numbers unchanged). It guards the
+# real format: if a future change stops this parsing, the check fails.
+REAL_REPLY = {
+    "model": "microsoft-decision-1",
+    "answers": {
+        "hardcoded_secret": {"noul": 0.6224621673326339, "type": "noul"},
+        "shell_injection": {"noul": 0.7981875015706547, "type": "noul"},
+        "worst_problem": {
+            "choice": "command_injection",
+            "confidence": 0.7735301735799088,
+            "probabilities": {
+                "cannot_tell": 0.0029939802866135895,
+                "command_injection": 0.8301476301849317,
+                "hardcoded_secret": 0.16346576539816604,
+                "none": 0.003392624130288762,
+            },
+            "type": "choice",
+        },
+    },
+    "usage": {"input_tokens": 163, "output_tokens": 3},
+}
+
+
 def demo() -> None:
     KEY = "test-key-0123456789"
     SECRET_STATE = 'DB_PASSWORD = "SuperSecret123!"\nimport os\nos.system("ping " + host)\n'
@@ -507,6 +536,24 @@ def demo() -> None:
             sys.modules.pop("azure.identity", None)
         else:
             sys.modules["azure.identity"] = saved_ident
+
+    # 15. the REAL reply captured from Microsoft's service parses into exactly the values it contained
+    real_questions = [
+        Question("hardcoded_secret", "yes_no", "Does the code contain a hardcoded password, key or token?"),
+        Question("shell_injection", "yes_no", "Does the code build a shell command from a variable?"),
+        Question("worst_problem", "choice", "Which is the most serious security problem in this code?",
+                 {"hardcoded_secret": "a secret", "command_injection": "a shell", "none": "nothing", "cannot_tell": "unclear"}),
+    ]
+    clf, _, _ = build([(200, {}, REAL_REPLY)])
+    real = clf.classify("x = 1", real_questions)
+    validate_result(real_questions, real)
+    assert real.answers["hardcoded_secret"].probability == 0.6224621673326339
+    assert real.answers["shell_injection"].probability == 0.7981875015706547
+    worst = real.answers["worst_problem"]
+    assert worst.choice == "command_injection" and worst.confidence == 0.7735301735799088
+    assert worst.probabilities["hardcoded_secret"] == 0.16346576539816604 and abs(sum(worst.probabilities.values()) - 1.0) < 1e-9
+    assert real.input_tokens == 163 and real.model == "Microsoft-Decision-1@1" and clf.last_raw["model"] == "microsoft-decision-1"
+    assert worst.confidence != worst.probabilities["command_injection"]          # confidence is its own number, not the top probability
 
     # 10. settings drive the adapter: deployment, version, timeout, attempts; a pasted full URL works; own endpoint and key win
     env = {"FOUNDRY_ENDPOINT": "https://r.services.ai.azure.com/providers/microsoft/v1/systemone", "FOUNDRY_API_KEY": KEY,
