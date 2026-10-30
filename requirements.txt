@@ -1,13 +1,18 @@
 # Runtime: the rules engine for Python
 bandit
 
+# Runtime: the HTTP service (python -m security_service.api)
+fastapi
+uvicorn
+
 # Optional: only for the Azure Foundry adapter (adapters/foundry_llm.py)
 azure-ai-inference
 
 # Optional: only for Microsoft Entra ID sign-in to Decision-1 (DECISION1_AUTH=entra)
 # azure-identity
 
-# Development and tests: the contract check
+# Development and tests: the contract check, and the test client for the HTTP service
 pyyaml
 jsonschema
 openapi-spec-validator
+httpx

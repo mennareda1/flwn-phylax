@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Flwn security service API
-  version: 1.0.0
+  version: 1.1.0
   summary: Scan generated code for vulnerabilities, propose fixes, and verify them.
   description: |
     An independent service. It never imports Flwn code and never reads Flwn data. Flwn sends
@@ -31,6 +31,8 @@ info:
       against any Flwn system.
     - Submitted code is kept only for the retention window in `GET /v1/capabilities`, and can be
       removed earlier with `DELETE /v1/scans/{scan_id}`.
+    - An operation whose feature is not available answers `501` with a `Problem` whose `code` is `not_implemented`;
+      `GET /v1/capabilities` lists the available `features`.
     - Any operation can also answer `500` with a `Problem` whose `code` is `internal_error`. The body
       never contains internal details such as stack traces or provider messages.
 servers:
@@ -98,6 +100,8 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Scan'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '404': {$ref: '#/components/responses/NotFound'}
     delete:
       tags: [scans]
@@ -107,6 +111,8 @@ paths:
       responses:
         '204': {description: Purged.}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '404': {$ref: '#/components/responses/NotFound'}
 
   /v1/scans/{scan_id}/fixes:
@@ -146,6 +152,7 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/IdempotencyConflict'}
         '429': {$ref: '#/components/responses/RateLimited'}
+        '501': {$ref: '#/components/responses/NotImplemented'}
         '503': {$ref: '#/components/responses/Unavailable'}
 
   /v1/fixes/{fix_id}:
@@ -163,6 +170,8 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Fix'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '404': {$ref: '#/components/responses/NotFound'}
 
   /v1/verifications:
@@ -202,6 +211,7 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
         '429': {$ref: '#/components/responses/RateLimited'}
+        '501': {$ref: '#/components/responses/NotImplemented'}
         '503': {$ref: '#/components/responses/Unavailable'}
 
   /v1/verifications/{verification_id}:
@@ -219,6 +229,8 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Verification'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '404': {$ref: '#/components/responses/NotFound'}
 
   /v1/capabilities:
@@ -234,6 +246,7 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Capabilities'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '429': {$ref: '#/components/responses/RateLimited'}
 
   /healthz:
     get:
@@ -355,6 +368,12 @@ components:
           schema: {$ref: '#/components/schemas/Problem'}
     Unavailable:
       description: The service cannot do the work right now. Retry with backoff.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+
+    NotImplemented:
+      description: This operation's feature is not available in this deployment. `GET /v1/capabilities` lists which features are.
       content:
         application/problem+json:
           schema: {$ref: '#/components/schemas/Problem'}
@@ -593,7 +612,7 @@ components:
               - vulnerabilities in third-party dependencies
               - deployment, configuration and runtime behavior
           provenance:
-            contract_version: 1.0.0
+            contract_version: 1.1.0
             service_version: 0.1.0
             policy_version: policy-1
             engines:
@@ -774,14 +793,23 @@ components:
             max_total_bytes: {type: integer, minimum: 1}
             max_wait_seconds: {type: integer, minimum: 1}
         retention_hours: {type: integer, minimum: 0}
+        features:
+          type: object
+          additionalProperties: false
+          required: [fixes, verifications]
+          description: Which optional features this deployment offers. A client should read this instead of trying and failing.
+          properties:
+            fixes: {type: boolean}
+            verifications: {type: boolean}
       examples:
-        - contract_version: 1.0.0
+        - contract_version: 1.1.0
           service_version: 0.1.0
           policy_version: policy-1
           languages:
             - {id: python, roles: [analyzer, detector]}
           limits: {max_files: 50, max_file_bytes: 200000, max_total_bytes: 1000000, max_wait_seconds: 30}
           retention_hours: 24
+          features: {fixes: false, verifications: false}
 
     Readiness:
       type: object
@@ -819,6 +847,7 @@ components:
             - rate_limited
             - provider_unavailable
             - internal_error
+            - not_implemented
         request_id: {type: string}
       examples:
         - type: about:blank

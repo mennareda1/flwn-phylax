@@ -175,6 +175,11 @@ class ScanService:
             "retention_hours": retention_hours,
         }
 
+    def validate_request(self, files: list[SourceFile], language: str | None = None) -> None:
+        """Raise exactly the errors scan() would raise for a bad request, without scanning. The HTTP service calls it
+        before queuing work, so a bad request is answered at once instead of becoming a failed job."""
+        prepare_files(files, language, self.supported_languages, self._limits)
+
     def scan_snippet(self, code: str, language: str = "python", path: str = "snippet") -> ScanReport:
         return self.scan([SourceFile(path, code)], language=language)
 
@@ -200,7 +205,11 @@ class ScanService:
                     continue
                 if analyzer not in engines_used:
                     engines_used.append(analyzer)
-                result: AnalyzerResult = analyzer.analyze(file.content, file.language)
+                try:
+                    result: AnalyzerResult = analyzer.analyze(file.content, file.language)
+                except Exception as problem:        # noqa: BLE001 - an engine must RETURN its failures; one that raises fails closed instead
+                    # the type only, never the message: an exception message can contain the code being scanned
+                    result = AnalyzerResult(analyzer=analyzer.name, error=f"the engine crashed ({type(problem).__name__})")
                 if result.ok:
                     analyzers_ok.add(result.analyzer)
                     for finding in result.findings:
@@ -372,6 +381,19 @@ def demo() -> None:
     relaxed = ScanService(optional, strict_coverage=False).scan_snippet("x = 1")
     assert relaxed.decision == Decision.PASS and "model@snippet" in relaxed.coverage.analyzers_failed
 
+    # an engine that RAISES (instead of returning its failure) fails closed, and its message, which may hold code, never surfaces
+    class Raising:
+        role, languages, name = "analyzer", ("python",), "raising-engine"
+
+        def analyze(self, code, language):
+            raise RuntimeError("boom with the code: " + code[:12])
+
+    survived = ScanService([Raising(), _StubAnalyzer("working", [finding(sev=Severity.MEDIUM, conf=Confidence.MEDIUM, src="working")])]).scan_snippet("x = 1  # TOPSECRET")
+    assert survived.decision == Decision.REVIEW_REQUIRED and len(survived.findings) == 1                    # the other engine still counts
+    assert survived.coverage.analyzers_failed == {"raising-engine@snippet": "the engine crashed (RuntimeError)"} and "TOPSECRET" not in json.dumps(survived.to_dict()) and "boom" not in json.dumps(survived.to_dict())
+    assert ScanService([Raising(), _StubAnalyzer("working")]).scan_snippet("x = 1").decision == Decision.SCAN_FAILED     # a pass is impossible with an engine down
+    assert ScanService([Raising()]).scan_snippet("x = 1").decision == Decision.SCAN_FAILED
+
     # ---- Decision-1 as an engine (a scripted stand-in: no network)
     from security_service.adapters.fakes import FakeClassifier
     from security_service.config import Settings
@@ -448,6 +470,15 @@ def demo() -> None:
         raise AssertionError("expected a refusal")
     except ValueError as refusal:
         assert "not ready" in str(refusal)
+
+    # validate_request raises what scan raises, and does not scan
+    service.validate_request([SourceFile("a.py", "x = 1")])
+    for bad_request, error in (([], InvalidScanInput), ([SourceFile("a.cob", "x")], UnsupportedLanguage)):
+        try:
+            service.validate_request(bad_request, "cobol" if error is UnsupportedLanguage else None)
+            raise AssertionError("expected a refusal")
+        except error:
+            pass
 
     # capabilities reflect the configured engines
     caps = ScanService([_StubAnalyzer("stub")]).capabilities()

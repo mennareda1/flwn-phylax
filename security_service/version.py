@@ -8,6 +8,6 @@ Three version stamps that appear in every report's provenance:
                       so a stored decision can always be traced to the policy that produced it.
 """
 
-CONTRACT_VERSION = "1.0.0"
+CONTRACT_VERSION = "1.1.0"
 SERVICE_VERSION = "0.1.0"
 POLICY_VERSION = "policy-1"

@@ -34,6 +34,11 @@ CHECKS = [
     "security_service.core.questions",
     "security_service.core.scan_service",
     "security_service.scan --selftest",
+    "security_service.api.auth",
+    "security_service.api.ratelimit",
+    "security_service.api.jobs",
+    "security_service.api.gateway",
+    "security_service.api --selftest",
     "security_service.config --selftest",
     "benchmark.cases_python",
     "benchmark.cases_heldout",
@@ -43,6 +48,8 @@ CHECKS = [
     "tests.check_contract",
     "tests.live_decision1 --selftest",
     "tests.check_transport",
+    "tests.check_api",
+    "tests.check_service",
 ]
 
 

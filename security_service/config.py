@@ -46,6 +46,8 @@ VARIABLES = (
     "DECISION1_ENDPOINT", "DECISION1_API_KEY", "DECISION1_DEPLOYMENT", "DECISION1_MODEL_VERSION",
     "DECISION1_AUTH", "DECISION1_TIMEOUT", "DECISION1_MAX_ATTEMPTS",
     "CLASSIFIER_ENABLED", "CLASSIFIER_REQUIRED", "CLASSIFIER_THRESHOLD",
+    "SERVICE_HOST", "SERVICE_PORT", "SERVICE_API_KEYS", "SERVICE_RETENTION_HOURS", "SERVICE_WORKERS",
+    "SERVICE_RATE_LIMIT_PER_MINUTE", "SERVICE_MAX_WAIT_SECONDS",
     "SCAN_MAX_FILES", "SCAN_MAX_FILE_BYTES", "SCAN_MAX_TOTAL_BYTES",
 )
 
@@ -217,6 +219,13 @@ class Settings:
     classifier_enabled: bool = False
     classifier_required: bool = False
     classifier_threshold: float = VALIDATED_THRESHOLD
+    service_host: str = "127.0.0.1"
+    service_port: int = 8080
+    service_api_keys: str = ""          # secret: never printed, only counted and named
+    service_retention_hours: int = 24
+    service_workers: int = 4
+    service_rate_limit_per_minute: int = 120
+    service_max_wait_seconds: int = 30
     scan_max_files: int = 50
     scan_max_file_bytes: int = 200_000
     scan_max_total_bytes: int = 1_000_000
@@ -245,6 +254,11 @@ class Settings:
             notes.append(f"CLASSIFIER_THRESHOLD={threshold:g} is not the {VALIDATED_THRESHOLD:.2f} that the held-out test validated; "
                          "results at another threshold have not been measured")
 
+        service_port = _number(environ, "SERVICE_PORT", 8080, int, 1, notes)
+        if service_port > 65535:
+            notes.append(f"SERVICE_PORT={service_port} is not a valid port; using 8080")
+            service_port = 8080
+
         return cls(
             foundry_endpoint=foundry_endpoint,
             foundry_api_key=foundry_key,
@@ -260,11 +274,47 @@ class Settings:
             classifier_enabled=_flag(environ, "CLASSIFIER_ENABLED", False, notes),
             classifier_required=_flag(environ, "CLASSIFIER_REQUIRED", False, notes),
             classifier_threshold=threshold,
+            service_host=_text(environ, "SERVICE_HOST", "127.0.0.1"),
+            service_port=service_port,
+            service_api_keys=_text(environ, "SERVICE_API_KEYS"),
+            service_retention_hours=_number(environ, "SERVICE_RETENTION_HOURS", 24, int, 1, notes),
+            service_workers=_number(environ, "SERVICE_WORKERS", 4, int, 1, notes),
+            service_rate_limit_per_minute=_number(environ, "SERVICE_RATE_LIMIT_PER_MINUTE", 120, int, 1, notes),
+            service_max_wait_seconds=min(_number(environ, "SERVICE_MAX_WAIT_SECONDS", 30, int, 1, notes), 120),
             scan_max_files=_number(environ, "SCAN_MAX_FILES", 50, int, 1, notes),
             scan_max_file_bytes=_number(environ, "SCAN_MAX_FILE_BYTES", 200_000, int, 1, notes),
             scan_max_total_bytes=_number(environ, "SCAN_MAX_TOTAL_BYTES", 1_000_000, int, 1, notes),
             warnings=tuple(notes),
         )
+
+    def service_problems(self) -> list[str]:
+        """What stops the HTTP service from starting. Problems never contain key text."""
+        from security_service.api.auth import parse_api_keys      # imported here: config must not depend on the service
+
+        _, problems = parse_api_keys(self.service_api_keys)
+        if self.classifier_enabled:
+            problems += [f"CLASSIFIER_ENABLED is on but {p[0].lower() + p[1:]}" for p in self.problems()]
+        return problems
+
+    def describe_service(self) -> str:
+        """A summary of the service settings. Keys are never printed: only the callers' names and scopes."""
+        from security_service.api.auth import parse_api_keys
+
+        ring, problems = parse_api_keys(self.service_api_keys)
+        lines = [
+            f"service address ... http://{self.service_host}:{self.service_port}"
+            + ("   (this computer only)" if self.service_host in ("127.0.0.1", "localhost", "::1")
+               else "   (reachable from the network: put HTTPS in front of it)"),
+            f"callers ........... {ring.describe()}" if len(ring) else "callers ........... NONE (the service will not start)",
+            f"submitted code kept {self.service_retention_hours} hours, in memory only; {self.service_workers} scans at a time; "
+            f"{self.service_rate_limit_per_minute} requests per minute per caller; waits up to {self.service_max_wait_seconds} s",
+            "Decision-1 in scans: " + (f"ON at {self.classifier_threshold:.2f}" if self.classifier_enabled else "OFF (rules only)"),
+        ]
+        lines += [f"WARNING: {w}" for w in self.warnings]
+        found = self.service_problems()
+        lines.append("Problems: none" if not found else "Problems:")
+        lines += [f"  - {p}" for p in found]
+        return "\n".join(lines)
 
     def limits(self) -> Limits:
         return Limits(self.scan_max_files, self.scan_max_file_bytes, self.scan_max_total_bytes)
@@ -444,6 +494,25 @@ def demo() -> None:
     assert any("not the 0.70" in w for w in odd.warnings)
     assert Settings.from_env({**base, "CLASSIFIER_THRESHOLD": "1.5"}).classifier_threshold == 0.70
     assert Settings.from_env({**base, "CLASSIFIER_THRESHOLD": "soon"}).classifier_threshold == 0.70
+
+    # --- the service settings: safe defaults, validated, and the keys never printed
+    service_key = "Kq3vZ8nR2mXw5tYb7LcD9fGh1JpS4aUe"
+    svc = Settings.from_env({**base, "SERVICE_API_KEYS": f"flwn-ai:scan+fix+read:{service_key}"})
+    assert (svc.service_host, svc.service_port, svc.service_retention_hours, svc.service_workers) == ("127.0.0.1", 8080, 24, 4)
+    assert svc.service_problems() == [] and service_key not in svc.describe_service() and "flwn-ai (scan+fix+read)" in svc.describe_service()
+    assert "this computer only" in svc.describe_service() and "Problems: none" in svc.describe_service()
+    assert "reachable from the network" in Settings.from_env({**base, "SERVICE_HOST": "0.0.0.0", "SERVICE_API_KEYS": f"a:read:{service_key}"}).describe_service()
+    no_keys = Settings.from_env(base)
+    assert no_keys.service_problems() and "NONE" in no_keys.describe_service()                       # no keys: it refuses to run
+    bad_key = Settings.from_env({**base, "SERVICE_API_KEYS": "a:scan:tooshort"})
+    assert bad_key.service_problems() and "tooshort" not in bad_key.describe_service() and "tooshort" not in " ".join(bad_key.service_problems())
+    tuned_svc = Settings.from_env({**base, "SERVICE_PORT": "9000", "SERVICE_WORKERS": "8", "SERVICE_RETENTION_HOURS": "48",
+                                   "SERVICE_RATE_LIMIT_PER_MINUTE": "30", "SERVICE_MAX_WAIT_SECONDS": "500", "SERVICE_API_KEYS": f"a:read:{service_key}"})
+    assert (tuned_svc.service_port, tuned_svc.service_workers, tuned_svc.service_retention_hours, tuned_svc.service_rate_limit_per_minute) == (9000, 8, 48, 30)
+    assert tuned_svc.service_max_wait_seconds == 120                                                  # capped
+    assert Settings.from_env({**base, "SERVICE_PORT": "70000"}).service_port == 8080 and Settings.from_env({**base, "SERVICE_PORT": "x"}).service_port == 8080
+    on_without_model = Settings.from_env({"CLASSIFIER_ENABLED": "true", "SERVICE_API_KEYS": f"a:read:{service_key}"})
+    assert any("CLASSIFIER_ENABLED is on but" in p for p in on_without_model.service_problems())
 
     # --- placeholders are caught before any call is made (the most common mistake after copying .env.example)
     assert any("placeholder YOUR-RESOURCE" in p for p in Settings.from_env({"FOUNDRY_ENDPOINT": "https://YOUR-RESOURCE.services.ai.azure.com", "FOUNDRY_API_KEY": "k" * 32}).problems())

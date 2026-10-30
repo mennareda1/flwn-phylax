@@ -37,6 +37,10 @@ screenshot it. `.env.example` is the committed template and contains placeholder
 | `CLASSIFIER_ENABLED` | no | `false` | `true` also asks Decision-1 about every Python file in a real scan (see below). |
 | `CLASSIFIER_REQUIRED` | no | `false` | `true` makes a Decision-1 outage turn a would-be pass into `scan_failed`. |
 | `CLASSIFIER_THRESHOLD` | no | `0.70` | Probability at or above which a category becomes a finding. 0.70 is what the held-out test validated. |
+| `SERVICE_API_KEYS` | for the service | none | Who may call it: `name:scopes:key`, comma-separated. Make a key with `python -m security_service.api --new-key`. |
+| `SERVICE_HOST`, `SERVICE_PORT` | no | `127.0.0.1`, `8080` | Where it listens. `127.0.0.1` means this computer only. |
+| `SERVICE_RETENTION_HOURS` | no | `24` | How long submitted code and results are kept (in memory only). |
+| `SERVICE_WORKERS`, `SERVICE_RATE_LIMIT_PER_MINUTE`, `SERVICE_MAX_WAIT_SECONDS` | no | `4`, `120`, `30` | Scans at once, requests per minute per caller, longest `Prefer: wait`. |
 | `SCAN_MAX_FILES`, `SCAN_MAX_FILE_BYTES`, `SCAN_MAX_TOTAL_BYTES` | no | `50`, `200000`, `1000000` | Request limits. |
 | `SECURITY_ENV_FILE` | no | | Path of a `.env` file to use instead of the default lookup. |
 
@@ -49,6 +53,42 @@ How settings are found, in order of priority:
 A `.env` file is read only by entry points (`tests.live_decision1`, `security_service.config`, and later
 the HTTP service). Library code and the automated checks never read it, so a real `.env` cannot change
 what a test does.
+
+## The HTTP service
+
+This is how Flwn calls the scanner. It implements the contract in `openapi.yaml` (version 1.1.0).
+
+    python -m security_service.api --new-key     # make a key, and show the line to put in .env
+    python -m security_service.api --check       # show the settings and any problem, without starting
+    python -m security_service.api               # start it (Ctrl+C stops it)
+
+Callers sign in with `Authorization: Bearer <key>`. Each key has a name and scopes: `scan` (create scans, delete them),
+`fix` (request fixes), `read` (fetch results). A caller sees only its own scans: another caller's scan is "not found".
+
+How a request is handled, in order: the key is checked first (so an unauthenticated caller learns nothing about
+whether its request was well-formed), then the scope, then the caller's rate limit, then the size and shape of the
+body. A bad request is answered at once with a `Problem` that never repeats what was sent; it never becomes a failed job.
+
+Waiting: `Prefer: wait=N` holds the request up to N seconds (never more than `SERVICE_MAX_WAIT_SECONDS`) and answers 200
+with the finished scan; otherwise 202 with a `Location` to poll. Retrying with the same `Idempotency-Key` and the same
+body returns the original scan instead of starting another (and makes no second model call).
+
+What it keeps, and what it does not: submitted code and results are held in MEMORY ONLY for `SERVICE_RETENTION_HOURS`,
+removed earlier by `DELETE /v1/scans/{id}`, and gone when the service stops. Nothing is written to disk. Logs hold one line
+per request (method, path, status, time, caller, request id): never a body, a key or a line of code.
+
+What it does not do yet, said plainly:
+- Fixes and verifications answer `501 not_implemented` (the corrector is the next step). `GET /v1/capabilities` has
+  `features` so a client can ask first.
+- It speaks plain HTTP. Put HTTPS in front of it (a reverse proxy or the platform's ingress) before it is reachable
+  from anywhere but this computer; the default `SERVICE_HOST=127.0.0.1` is deliberately that safe.
+- One instance only: scans, keys-to-scans, idempotency and rate limits live in this process. Running several copies behind
+  a load balancer needs a shared store and limiter first, and a restart forgets every scan.
+- No chunking of very large files for the model, and no per-key limits on how many scans a caller may hold.
+
+Tests: `python -m tests.check_api` runs the real application in-process and checks every response against the contract
+(status, content type, body), and that no key or submitted code appears in any error or log line. `python -m
+tests.check_service` starts the real process from a `.env` and talks to it over real sockets.
 
 ## Decision-1 inside real scans
 
@@ -129,8 +169,10 @@ Rules for the benchmark: every safe case must be clean for every category, not o
       core/                            stable: schema, decision policy, files, scan service, errors, redaction, patching, questions
       ports/                           stable interfaces: analyzer, llm, classifier, corrector
       adapters/                        swappable: bandit, secrets_check, llm_detector, decision1, classifier_detector, foundry_llm, llm_clients, fakes
+      api/                             the HTTP service: gateway (all rules), app (FastAPI), auth, jobs, ratelimit; `python -m security_service.api`
+      scan.py                          scan files from the command line
     benchmark/                         development cases, held-out cases, scoreboard, bake-off, classifier_eval (step 3)
-    tests/                             run_all, check_contract, check_transport, check_layout, live_decision1
+    tests/                             run_all, check_contract, check_api, check_service, check_transport, check_layout, live_decision1
 
 Rule of thumb: `core/` and `ports/` never change when a provider changes. Only `adapters/` and
 configuration do. A new provider must pass the port's validation rules and clear the benchmark gate.
@@ -141,19 +183,18 @@ Other commands: `python -m tests.check_contract` (code against the contract, wit
 
 ## Status
 
-Built and tested: the core, the ports, the Bandit, secrets-check, LLM-detector and Decision-1 classifier
-adapters, the settings and `.env` support, the benchmark and bake-off, the contract, and an end-to-end
-test of the real network code against a fake server on this machine.
+Built and tested: the core, the ports, the Bandit, secrets-check, LLM-detector and Decision-1 adapters; Decision-1 as an
+optional engine in real scans; the settings and `.env` support; the benchmark (50 development and 39 held-out cases) and
+the held-out test of Decision-1 (passed, see `benchmark/results/`); the contract; the HTTP service for scans (keys and
+scopes, rate limits, idempotency, wait or poll, retention, delete); and end-to-end tests over real sockets.
 
-Run against the real service: Decision-1. One real call on 2026-10-23 confirmed sign-in with an API
-key, the request, the reply format and the parsing (the reply is kept as a regression test). Its
-accuracy on code is not measured yet.
+Run against the real service: Decision-1 (sign-in, request, reply, and the held-out test).
 
 Not yet run against a real model: the LLM detector and the Foundry adapter.
 
-Not built yet: the HTTP service (FastAPI, auth, job store, idempotency, retention), the fix and
-verification services, the security question set and code chunking for the classifier, the classifier
-promotion test, the Astra corrector adapter, and the C++, C# and JS lanes.
+Not built yet: the corrector (GPT-6 Astra) and the fix and verification services behind the 501s, the Flwn side of the
+integration, chunking of large files for the model, a persistent job store and a shared rate limiter for running several
+instances, TLS, and the C++, C# and JS lanes.
 
 ## Decisions recorded here
 
@@ -193,6 +234,12 @@ promotion test, the Astra corrector adapter, and the C++, C# and JS lanes.
   The threshold is the one the held-out test validated (0.70); other values are accepted with a warning that they have
   not been measured. Passing that test means the model is worth using as a review signal, not that it is accurate in
   general; real Executor outputs are the next test.
+- The service never starts without an API key, never runs unauthenticated, and listens on this computer only unless
+  told otherwise. Keys are kept only as digests and compared in constant time; no message contains one.
+- Scans are held in memory only, so a restart forgets them and the retention promise cannot be broken by a forgotten file.
+  The cost is that it is one instance only; a persistent store is a later, deliberate step.
+- An engine that raises instead of returning its failure is treated as a failed engine, never as a crashed scan, and only
+  the type of its exception is recorded (the message may contain code).
 - A secret found by pattern asks for human review but never blocks on its own: a pattern cannot tell a
   live key from the documented example key, and only HIGH confidence blocks. Masking is liberal (a
   missed secret leaks); reporting is careful (every report is an alarm). The known gap: a real secret

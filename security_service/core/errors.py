@@ -41,7 +41,39 @@ def problem_for(exc: Exception, request_id: str | None = None) -> dict[str, Any]
     return problem
 
 
+_API_PROBLEMS = {
+    "invalid_request": (400, "Invalid request"),
+    "unauthorized": (401, "Unauthorized"),
+    "forbidden": (403, "Forbidden"),
+    "not_found": (404, "Not found"),
+    "idempotency_conflict": (409, "Idempotency conflict"),
+    "payload_too_large": (413, "Payload too large"),
+    "unsupported_language": (422, "Unsupported language"),
+    "rate_limited": (429, "Too many requests"),
+    "internal_error": (500, "Internal error"),
+    "not_implemented": (501, "Not implemented"),
+    "provider_unavailable": (503, "Service unavailable"),
+}
+
+
+def api_problem(code: str, detail: str, request_id: str | None = None) -> dict[str, Any]:
+    """A contract-shaped error body for the errors the HTTP layer itself raises. `code` is one of the contract's codes."""
+    status, title = _API_PROBLEMS[code]
+    problem: dict[str, Any] = {"type": "about:blank", "title": title, "status": status, "detail": detail, "code": code}
+    if request_id:
+        problem["request_id"] = request_id
+    return problem
+
+
 def demo() -> None:
+    assert api_problem("unauthorized", "x") == {"type": "about:blank", "title": "Unauthorized", "status": 401, "detail": "x", "code": "unauthorized"}
+    assert api_problem("not_implemented", "y", "req_1")["status"] == 501 and api_problem("not_implemented", "y", "req_1")["request_id"] == "req_1"
+    assert {code for code in _API_PROBLEMS} | {"payload_too_large", "unsupported_language", "invalid_request"} == set(_API_PROBLEMS)
+    try:
+        api_problem("telepathy", "z")
+        raise AssertionError("an unknown code must be refused")
+    except KeyError:
+        pass
     assert problem_for(PayloadTooLarge("too many files (51, limit 50)"))["status"] == 413
     assert problem_for(UnsupportedLanguage("x"))["code"] == "unsupported_language"
     assert problem_for(InvalidScanInput("at least one file is required"))["code"] == "invalid_request"
