@@ -27,11 +27,15 @@ import yaml
 from jsonschema import Draft202012Validator
 from openapi_spec_validator import validate as validate_openapi
 
-from security_service.adapters.fakes import FakeCorrector
+from security_service.adapters.bandit import BanditAnalyzer
+from security_service.adapters.classifier_detector import ClassifierDetector
+from security_service.adapters.fakes import FakeClassifier, FakeCorrector
+from security_service.adapters.secrets_check import SecretsAnalyzer
 from security_service.core.errors import problem_for
 from security_service.core.files import InvalidScanInput, Limits, PayloadTooLarge, SourceFile, UnsupportedLanguage
 from security_service.core.scan_service import ScanService
 from security_service.core.schema import VULN_TYPES, Confidence, Decision, EvidenceTier, Severity
+from security_service.ports.classifier import Answer
 from security_service.ports.corrector import FixConstraints
 from security_service.version import CONTRACT_VERSION
 
@@ -103,6 +107,16 @@ def run() -> None:
         assert result.decision.value == label, (label, result.decision)
         check("ScanReport", result.to_dict())
 
+    # a report that contains MODEL findings (whole-file, no line, no CWE) and the classifier role must match the contract too
+    flagged = ClassifierDetector(FakeClassifier(lambda state, q: Answer("yes_no", probability=0.95 if q.id == "path_traversal" else 0.01), name="decision-stand-in"))
+    with_model = ScanService([BanditAnalyzer(), SecretsAnalyzer(), flagged], limits=Limits(max_files=10, max_file_bytes=300, max_total_bytes=5000))
+    model_report = with_model.scan([files[1]])
+    check("ScanReport", model_report.to_dict())
+    assert model_report.decision == Decision.REVIEW_REQUIRED and model_report.findings[0].line is None
+    assert model_report.to_dict()["findings"][0]["evidence_tier"] == "model_suspicion"
+    assert {"role": "classifier", "name": "decision-stand-in"} in model_report.to_dict()["provenance"]["engines"]
+    check("Capabilities", with_model.capabilities())
+    assert {"id": "python", "roles": ["analyzer", "classifier"]} in with_model.capabilities()["languages"]
     check("Capabilities", service.capabilities())
     check("Readiness", {"status": "ready", "checks": {"analyzers": "ok"}})
 

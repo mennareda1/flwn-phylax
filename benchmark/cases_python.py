@@ -267,35 +267,37 @@ def hello():
     name = request.args.get("name", "")
     return render_template_string("<h1>Hello {{ name }}</h1>", name=name)
 '''),
-    _case("jinja-autoescape-off", "vulnerable", "xss_or_template_injection", "Jinja2 environment with autoescape disabled", '''
+    _case("jinja-autoescape-off", "vulnerable", "xss_or_template_injection", "Jinja2 environment with autoescape disabled (fixed template)", '''
 import jinja2
 
 env = jinja2.Environment(autoescape=False)
+TEMPLATE = env.from_string("<p>Hello {{ name }}</p>")
 
-def render(template_text, **values):
-    return env.from_string(template_text).render(**values)
+def render(name):
+    return TEMPLATE.render(name=name)
 '''),
-    _case("jinja-autoescape-on", "fixed", "xss_or_template_injection", "autoescape enabled", '''
+    _case("jinja-autoescape-on", "fixed", "xss_or_template_injection", "autoescape enabled, fixed template (corrected: it used to build the template from a parameter, which is template injection)", '''
 import jinja2
 
 env = jinja2.Environment(autoescape=True)
+TEMPLATE = env.from_string("<p>Hello {{ name }}</p>")
 
-def render(template_text, **values):
-    return env.from_string(template_text).render(**values)
+def render(name):
+    return TEMPLATE.render(name=name)
 '''),
 
     # ---------------- TLS verification ----------------
-    _case("tls-verify-off", "vulnerable", "tls_verification_disabled", "verify=False", '''
+    _case("tls-verify-off", "vulnerable", "tls_verification_disabled", "verify=False (fixed URL)", '''
 import requests
 
-def fetch(url):
-    return requests.get(url, verify=False, timeout=10).text
+def fetch_status():
+    return requests.get("https://api.example.com/status", verify=False, timeout=10).text
 '''),
-    _case("tls-verify-default", "fixed", "tls_verification_disabled", "default certificate verification", '''
+    _case("tls-verify-default", "fixed", "tls_verification_disabled", "default certificate verification, fixed URL (corrected: it used to fetch a parameter URL, which is SSRF)", '''
 import requests
 
-def fetch(url):
-    return requests.get(url, timeout=10).text
+def fetch_status():
+    return requests.get("https://api.example.com/status", timeout=10).text
 '''),
 
     # ---------------- debug mode ----------------
@@ -339,6 +341,11 @@ def test_addition():
 ]
 
 
+# RULE FOR EVERY SAFE CASE (fixed or lookalike): it must be clean for EVERY category, not only the one it twins.
+# Three safe cases once fetched a parameter URL (SSRF) or built a template from a parameter (template injection), so a
+# model that flagged them was right and the label was wrong. They were corrected on 2026-10-23, after the first real
+# model run, which makes these 50 cases a DEVELOPMENT set: their results were seen. Final judgment of the classifier
+# uses benchmark/cases_heldout.py, written before any model saw it.
 BASE_CASES = list(CASES)   # the original 41 cases, kept as a fixed reference set for before/after comparisons
 
 # Added in session 1 for the secrets check. They were written AFTER the check's heuristics were

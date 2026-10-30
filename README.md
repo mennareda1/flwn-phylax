@@ -34,6 +34,9 @@ screenshot it. `.env.example` is the committed template and contains placeholder
 | `DECISION1_ENDPOINT`, `DECISION1_API_KEY` | no | the two `FOUNDRY_*` above | A separate endpoint or key for Decision-1 only. |
 | `DECISION1_TIMEOUT` | no | `20` | Seconds to wait per attempt. |
 | `DECISION1_MAX_ATTEMPTS` | no | `3` | Attempts on temporary errors (429, 5xx, network). |
+| `CLASSIFIER_ENABLED` | no | `false` | `true` also asks Decision-1 about every Python file in a real scan (see below). |
+| `CLASSIFIER_REQUIRED` | no | `false` | `true` makes a Decision-1 outage turn a would-be pass into `scan_failed`. |
+| `CLASSIFIER_THRESHOLD` | no | `0.70` | Probability at or above which a category becomes a finding. 0.70 is what the held-out test validated. |
 | `SCAN_MAX_FILES`, `SCAN_MAX_FILE_BYTES`, `SCAN_MAX_TOTAL_BYTES` | no | `50`, `200000`, `1000000` | Request limits. |
 | `SECURITY_ENV_FILE` | no | | Path of a `.env` file to use instead of the default lookup. |
 
@@ -47,21 +50,60 @@ A `.env` file is read only by entry points (`tests.live_decision1`, `security_se
 the HTTP service). Library code and the automated checks never read it, so a real `.env` cannot change
 what a test does.
 
-## Measuring the decision model (step 3)
+## Decision-1 inside real scans
 
-`python -m benchmark.classifier_eval` sends the 50 benchmark cases to Decision-1 with the security questions
-(one yes/no per vulnerability category, plus a verdict that can say "cannot tell"), compares it with what the
-rules alone catch, and tests whether a comment such as "approved by the security team" talks it out of a true
-finding. Run it in this order:
+Until `CLASSIFIER_ENABLED=true`, Decision-1 is only used by the measuring tool, and a scan is Bandit plus the secrets
+check. Switched on, every Python file in a scan is also sent, masked, to Decision-1 in ONE request with the 12 security
+questions, and each category at or above the threshold becomes a finding in the report.
 
-    python -m benchmark.classifier_eval --limit 3     # a smoke test on 3 cases, first
-    python -m benchmark.classifier_eval               # the full run: about 100 requests, under a cent
+Try it on a file, switch off and on (PowerShell):
 
-It saves `classifier_eval_report.txt` (readable, contains no key) and `classifier_eval_results.json`; both are
-git-ignored. The pass/fail gate is written into the program and was fixed before the first real run: at one
-threshold the model must catch at least 2 vulnerable cases the rules miss, add at most 1 false alarm, and lose at
-most 10% of its catches to the comment. Passing only makes it a signal that asks for human review: a model alone
-never blocks. With 23 vulnerable cases it is a smoke test, not a measure of general accuracy.
+    python -m security_service.scan app.py                                       # rules only, the default
+    $env:CLASSIFIER_ENABLED = "true"; python -m security_service.scan app.py     # Decision-1 as well
+
+The exit code says what happened: 0 pass, 1 review_required, 2 block, 3 scan_failed, 4 could not start.
+
+What those findings are:
+- `model_suspicion` tier, medium severity, confidence at most medium, and no line: a decision model says "this file
+  probably has this problem", it does not point at a line. They carry no code.
+- They ask for human review (`review_required`). They never block: a model alone never blocks, even at 100% on
+  everything. Only a rule-backed, high-severity, high-confidence finding blocks.
+- If a rule already found the same problem in the same file, the two become one corroborated finding with the rule's
+  line and severity, and the model is credited as a second source. A model that claims MORE than the rule (a LOW rule
+  finding) stays as its own finding beside it.
+
+If Decision-1 is down: by default the scan still finishes on the rules, and the report says so in the coverage and in
+the decision reasons. With `CLASSIFIER_REQUIRED=true`, a scan that would have passed becomes `scan_failed` instead.
+A failed rules engine is fatal to a pass either way. If it is switched on but Decision-1 is not configured, the
+service refuses to start, so nobody believes they are protected by an engine that is not running.
+
+Limits, stated plainly: Python only; a file larger than about 30,000 tokens is not assessed by the model (no chunking
+yet; the rules still scan it and the report records the gap); the model sees masked code; it adds about half a
+second and a fraction of a cent per file.
+
+## Measuring the decision model (step 3, version 2)
+
+`python -m benchmark.classifier_eval` sends labeled cases to Decision-1 with the security questions (one yes/no per
+vulnerability category; none about secrets, which the secrets check owns), compares it with what the rules alone
+catch, and tests whether a comment such as "approved by the security team" talks it out of a true finding.
+
+Version 1 failed its gate on the 50 development cases. Reading the code showed most of that came from our own setup
+(secret masking, three mislabeled test cases, loose question wording), so version 2 fixed those. A fix chosen after
+seeing results cannot be judged on the same cases, so the verdict comes only from `benchmark/cases_heldout.py`: 39
+new cases, written before any model saw them, with a pinned fingerprint so an edit cannot go unnoticed.
+
+    python -m benchmark.classifier_eval --limit 3     # 1. smoke test on 3 development cases
+    python -m benchmark.classifier_eval               # 2. development run: every number, no final verdict
+    python -m benchmark.classifier_eval --heldout     # 3. THE final run. Do it once.
+
+The gate, fixed in the code before the held-out run. At the single threshold 0.70, all four must hold: it finds
+at least 80% of the vulnerable cases in the right category; it catches at least 1 case the rules do not alarm on; it
+adds at most 2 false alarms beyond the rules; it loses at most 10% of its catches to a comment claiming a security
+review. Passing only makes it a signal that asks for human review (a model alone never blocks). If it fails, the
+classifier is parked and the scanner ships with rules only; the questions are not reworded and re-tested on that set.
+
+Rules for the benchmark: every safe case must be clean for every category, not only the one it twins. Results go to
+`classifier_eval_report.txt` and `classifier_eval_results.json` (both git-ignored, neither contains a key).
 
 ## If a call fails
 
@@ -86,8 +128,8 @@ never blocks. With 23 vulnerable cases it is a smoke test, not a measure of gene
       version.py                       contract, service and policy versions
       core/                            stable: schema, decision policy, files, scan service, errors, redaction, patching, questions
       ports/                           stable interfaces: analyzer, llm, classifier, corrector
-      adapters/                        swappable: bandit, secrets_check, llm_detector, decision1, foundry_llm, llm_clients, fakes
-    benchmark/                         labeled cases, scoreboard, model bake-off, classifier_eval (the step-3 measurement)
+      adapters/                        swappable: bandit, secrets_check, llm_detector, decision1, classifier_detector, foundry_llm, llm_clients, fakes
+    benchmark/                         development cases, held-out cases, scoreboard, bake-off, classifier_eval (step 3)
     tests/                             run_all, check_contract, check_transport, check_layout, live_decision1
 
 Rule of thumb: `core/` and `ports/` never change when a provider changes. Only `adapters/` and
@@ -146,6 +188,11 @@ promotion test, the Astra corrector adapter, and the C++, C# and JS lanes.
 - The secrets check lives in `secrets_check.py`, not `secrets.py`: a module named `secrets` shadows the
   standard library's whenever its folder is first on the path (for example when a file there is run with
   an editor's Run button), which breaks every `import secrets` in that process.
+- Decision-1 in scans is OFF by default and OPTIONAL when on. Its findings are whole-file model suspicion at one flat
+  medium severity (a model gives a probability, not a severity), capped at medium confidence, and they never block.
+  The threshold is the one the held-out test validated (0.70); other values are accepted with a warning that they have
+  not been measured. Passing that test means the model is worth using as a review signal, not that it is accurate in
+  general; real Executor outputs are the next test.
 - A secret found by pattern asks for human review but never blocks on its own: a pattern cannot tell a
   live key from the documented example key, and only HIGH confidence blocks. Masking is liberal (a
   missed secret leaks); reporting is careful (every report is an alarm). The known gap: a real secret

@@ -40,8 +40,10 @@ EXPECTED_HOME = {
     "decide": "security_service/core/policy.py",
     "decide_nothing_scanned": "security_service/core/policy.py",
     "ScanService": "security_service/core/scan_service.py",
+    "format_report": "security_service/scan.py",
     "Settings": "security_service/config.py",
     "Decision1Classifier": "security_service/adapters/decision1.py",
+    "ClassifierDetector": "security_service/adapters/classifier_detector.py",
     "FoundryLLM": "security_service/adapters/foundry_llm.py",
     "BanditAnalyzer": "security_service/adapters/bandit.py",
     "SecretsAnalyzer": "security_service/adapters/secrets_check.py",
@@ -51,6 +53,8 @@ EXPECTED_HOME = {
     "problem_for": "security_service/core/errors.py",
     "build_questions": "security_service/core/questions.py",
     "evaluate": "benchmark/classifier_eval.py",
+    "check_heldout_intact": "benchmark/classifier_eval.py",
+    "fingerprint": "benchmark/cases_heldout.py",
 }
 NUMBERED_OR_COPY = re.compile(r"\(\d+\)|[ _-]copy\b", re.IGNORECASE)
 BACKUP_SUFFIX = re.compile(r"(\.orig|\.bak|~)$", re.IGNORECASE)

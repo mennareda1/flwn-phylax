@@ -3,8 +3,16 @@ security_service/core/questions.py
 
 The questions a decision model (Microsoft-Decision-1) is asked about a piece of code.
 
-One yes/no question per vulnerability category, so each category gets its own probability, plus one
-verdict question ("what is the most serious problem?") that can answer `none` or `cannot_tell`.
+One yes/no question per vulnerability category, so each category gets its own probability. There is NO question
+about hardcoded secrets: code is masked before it reaches any model, so the model cannot tell a real secret from a
+harmless masked value (a header name, an environment variable name), and the deterministic secrets check, which
+reads the original code locally, owns that category. An optional verdict question ("what is the most serious
+problem?") exists but is off by default; it was measurably noisy.
+
+Version 2 (2026-10-23): secrets and the verdict were removed from the default, and three questions were made more
+exact by reading them against the first run's misses (unsafe YAML loaders named; template-from-text named;
+SSRF limited to HTTP clients, so a ping does not count). The first run is a development set: judge version 2 on
+benchmark/cases_heldout.py, which no model had seen when it was written.
 
 How the questions are written, and why:
   - Each states an exact, literal condition. Microsoft documents that scores change with wording, and
@@ -12,8 +20,6 @@ How the questions are written, and why:
   - Each carries true/false criteria, which Microsoft documents as the way to sharpen borderline cases.
   - Each names the safe alternative ("instead of passing the values as parameters") so a safe look-alike
     is a clear "no".
-  - The secrets question explains the marker <REDACTED_SECRET>: code is masked before it reaches any
-    model, so a hidden secret must count as a secret.
   - The verdict has an abstention option, as Microsoft's guidance recommends for forced choices.
 
 These are a first draft. The evaluation (benchmark/classifier_eval.py) measures them; change the
@@ -24,7 +30,6 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from security_service.core.redaction import PLACEHOLDER
 from security_service.ports.classifier import Question, validate_questions
 
 VERDICT_ID = "worst_problem"
@@ -51,18 +56,11 @@ _CATEGORY_TEXT = {
         "Changing text is evaluated as code.",
         "Nothing is evaluated, or only a fixed literal is, or safe parsing such as ast.literal_eval is used.",
     ),
-    "hardcoded_credentials": (
-        f"The marker {PLACEHOLDER} stands for a real secret that was hidden, and counts as a secret written in the "
-        "source. Does the code contain a password, API key, access token or other secret written directly as a "
-        "literal value in the source, instead of being read from the environment or a secrets store?",
-        f"A secret literal, or the marker {PLACEHOLDER}, is written in the source.",
-        "Secrets are read from the environment or a store, or the only literals are not secrets (names, URLs, paths, versions).",
-    ),
     "insecure_deserialization": (
-        "Does the code load data with pickle, marshal, or an unsafe YAML loader (yaml.load without a safe loader), "
-        "where the data could come from outside the program?",
+        "Does the code load data with pickle or marshal, or with an unsafe YAML loader (yaml.load with yaml.Loader, "
+        "yaml.UnsafeLoader, yaml.FullLoader or no Loader argument), where the data could come from outside the program?",
         "Data is deserialized with an unsafe loader.",
-        "Only safe formats or loaders are used (for example json or yaml.safe_load), or nothing is deserialized.",
+        "Only safe formats or loaders are used (json, yaml.safe_load, or yaml.load with yaml.SafeLoader), or nothing is deserialized.",
     ),
     "weak_crypto": (
         "Does the code use a weak or broken algorithm for a security purpose, such as MD5 or SHA-1 to hash passwords "
@@ -83,17 +81,18 @@ _CATEGORY_TEXT = {
         "The path is fixed, or it is resolved and checked against a base directory.",
     ),
     "ssrf": (
-        "Does the code send a network request to a URL or host that comes from a variable or from input, without "
-        "checking it against an allow-list of permitted hosts?",
-        "A request goes to a URL supplied from outside without a check.",
-        "The URL is fixed, or it is validated against an allow-list.",
+        "Running a command such as ping is not an HTTP request and does not count here. Does the code send an HTTP or "
+        "HTTPS request (with requests, urllib, httpx, aiohttp or a similar library) to a URL that comes from a "
+        "variable or from input, without checking the host against an allow-list?",
+        "An HTTP request goes to a URL supplied from outside without a check.",
+        "The URL is a fixed literal, or its host is validated against an allow-list, or no HTTP request is made.",
     ),
     "xss_or_template_injection": (
-        "Does the code build a template from variable text (for example a template created from user text, or an "
-        "f-string passed to a template engine as the template itself), or switch off HTML auto-escaping in a "
-        "template environment?",
+        "Does the code build a template from variable text, for example by joining or formatting variable text into the "
+        "string given to render_template_string, Template(...) or env.from_string, or does it switch off HTML "
+        "auto-escaping in a template environment?",
         "Template source comes from changing text, or auto-escaping is off.",
-        "Templates are fixed, values are passed as template variables, and auto-escaping is on.",
+        "Template text is a fixed literal, values are passed as template variables, and auto-escaping is on.",
     ),
     "tls_verification_disabled": (
         "Does the code switch off TLS or SSL certificate verification, for example verify=False in a requests call "
@@ -118,8 +117,9 @@ _CATEGORY_TEXT = {
 CATEGORY_IDS = tuple(_CATEGORY_TEXT)
 
 
-def build_questions(categories: Iterable[str] | None = None, include_verdict: bool = True) -> list[Question]:
-    """The yes/no questions (one per category) and, by default, the verdict question, ready to send."""
+def build_questions(categories: Iterable[str] | None = None, include_verdict: bool = False) -> list[Question]:
+    """The yes/no questions (one per category), ready to send. The verdict question is off by default: in the first real
+    run it named a problem on 14 of 27 safe cases, including clean fixes the yes/no questions judged safe."""
     chosen = tuple(categories) if categories is not None else CATEGORY_IDS
     unknown = [c for c in chosen if c not in _CATEGORY_TEXT]
     if unknown:
@@ -145,40 +145,50 @@ def build_questions(categories: Iterable[str] | None = None, include_verdict: bo
 def demo() -> None:
     from security_service.core.schema import VULN_TYPES
 
-    # every concrete vulnerability category has a question; "other" is a catch-all with no testable condition
-    assert set(CATEGORY_IDS) == set(VULN_TYPES) - {"other"}, set(VULN_TYPES) ^ set(CATEGORY_IDS)
+    # every category the classifier is asked about has a question. "other" is a catch-all with no testable
+    # condition, and hardcoded_credentials belongs to the deterministic secrets check, not to a model
+    assert "hardcoded_credentials" not in CATEGORY_IDS
+    assert set(CATEGORY_IDS) == set(VULN_TYPES) - {"other", "hardcoded_credentials"}, set(VULN_TYPES) ^ set(CATEGORY_IDS)
 
     everything = build_questions()
-    assert len(everything) == len(CATEGORY_IDS) + 1 and everything[-1].id == VERDICT_ID
+    assert len(everything) == len(CATEGORY_IDS) == 12 and VERDICT_ID not in {q.id for q in everything}   # verdict is off by default
     assert len({q.id for q in everything}) == len(everything)
     validate_questions(everything)
 
-    for question in everything[:-1]:
+    for question in everything:
         assert question.kind == "yes_no" and set(question.options) == {"true", "false"}
         assert question.instructions.endswith("?") and len(question.instructions) > 60, question.id
-    verdict = everything[-1]
-    assert set(verdict.options) == set(CATEGORY_IDS) | {"none", "cannot_tell"}      # it can abstain, as Microsoft advises
+        assert "REDACTED" not in question.instructions and "secret" not in question.instructions.lower().replace("secrets module", ""), question.id
 
-    # the masked-secret marker is explained, using the very marker the masking produces
-    secrets_question = next(q for q in everything if q.id == "hardcoded_credentials")
-    assert PLACEHOLDER in secrets_question.instructions and PLACEHOLDER in secrets_question.options["true"]
+    # the three questions rewritten in version 2 say what they were rewritten to say
+    text = {q.id: q.instructions for q in everything}
+    assert all(name in text["insecure_deserialization"] for name in ("yaml.Loader", "yaml.UnsafeLoader", "yaml.FullLoader"))
+    assert "render_template_string" in text["xss_or_template_injection"] and "env.from_string" in text["xss_or_template_injection"]
+    assert "ping" in text["ssrf"] and "HTTP" in text["ssrf"]
+
+    # the optional verdict question can still abstain, as Microsoft advises for forced choices
+    with_verdict = build_questions(include_verdict=True)
+    verdict = with_verdict[-1]
+    assert verdict.id == VERDICT_ID and verdict.kind == "choice" and len(with_verdict) == 13
+    assert set(verdict.options) == set(CATEGORY_IDS) | {"none", "cannot_tell"}
 
     # every text is plain ASCII, so it prints safely in any Windows console
-    for question in everything:
-        for text in (question.id, question.instructions, *(question.options or {}).values()):
-            assert text.isascii(), (question.id, text[:40])
+    for question in with_verdict:
+        for piece in (question.id, question.instructions, *(question.options or {}).values()):
+            assert piece.isascii(), (question.id, piece[:40])
 
-    # a subset, without the verdict, and an unknown category
-    subset = build_questions(["ssrf", "path_traversal"], include_verdict=False)
+    # a subset, and an unknown category (including the one that is deliberately not asked)
+    subset = build_questions(["ssrf", "path_traversal"])
     assert [q.id for q in subset] == ["ssrf", "path_traversal"]
-    try:
-        build_questions(["telepathy"])
-        raise AssertionError("expected an unknown category to be rejected")
-    except ValueError:
-        pass
+    for unknown in ("telepathy", "hardcoded_credentials"):
+        try:
+            build_questions([unknown])
+            raise AssertionError(f"expected {unknown!r} to be rejected")
+        except ValueError:
+            pass
 
     size = sum(len(q.instructions) + sum(len(v) for v in (q.options or {}).values()) for q in everything)
-    print(f"core.questions OK: {len(CATEGORY_IDS)} category questions plus a verdict that can abstain; all valid, ASCII, "
+    print(f"core.questions OK: {len(CATEGORY_IDS)} yes/no questions, none about secrets, verdict off by default; all valid and ASCII, "
           f"about {size // 4} tokens of question text per request")
 
 

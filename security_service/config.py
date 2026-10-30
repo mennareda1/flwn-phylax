@@ -45,6 +45,7 @@ VARIABLES = (
     "FOUNDRY_ENDPOINT", "FOUNDRY_API_KEY",
     "DECISION1_ENDPOINT", "DECISION1_API_KEY", "DECISION1_DEPLOYMENT", "DECISION1_MODEL_VERSION",
     "DECISION1_AUTH", "DECISION1_TIMEOUT", "DECISION1_MAX_ATTEMPTS",
+    "CLASSIFIER_ENABLED", "CLASSIFIER_REQUIRED", "CLASSIFIER_THRESHOLD",
     "SCAN_MAX_FILES", "SCAN_MAX_FILE_BYTES", "SCAN_MAX_TOTAL_BYTES",
 )
 
@@ -184,6 +185,22 @@ def _looks_like_placeholder(value: str) -> bool:
     return lowered in _PLACEHOLDER_KEYS or lowered.startswith(("your-", "your_", "paste"))
 
 
+_TRUE, _FALSE = {"1", "true", "yes", "on"}, {"0", "false", "no", "off"}
+VALIDATED_THRESHOLD = 0.70      # the value the held-out test (2026-10-23) validated; changing it needs a new measurement
+
+
+def _flag(environ: Mapping[str, str], name: str, default: bool, notes: list[str]) -> bool:
+    raw = (environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in _TRUE:
+        return True
+    if raw in _FALSE:
+        return False
+    notes.append(f"{name}={raw!r} is not true or false; using {str(default).lower()}")
+    return default
+
+
 @dataclass(frozen=True)
 class Settings:
     foundry_endpoint: str = ""
@@ -197,6 +214,9 @@ class Settings:
     decision1_auth: str = "key"
     decision1_timeout: float = 20.0
     decision1_max_attempts: int = 3
+    classifier_enabled: bool = False
+    classifier_required: bool = False
+    classifier_threshold: float = VALIDATED_THRESHOLD
     scan_max_files: int = 50
     scan_max_file_bytes: int = 200_000
     scan_max_total_bytes: int = 1_000_000
@@ -217,6 +237,14 @@ class Settings:
         foundry_key = _text(environ, "FOUNDRY_API_KEY")
         own_key = _text(environ, "DECISION1_API_KEY")
 
+        threshold = _number(environ, "CLASSIFIER_THRESHOLD", VALIDATED_THRESHOLD, float, 0.01, notes)
+        if threshold > 1.0:
+            notes.append(f"CLASSIFIER_THRESHOLD={threshold} is above 1; using {VALIDATED_THRESHOLD}")
+            threshold = VALIDATED_THRESHOLD
+        if threshold != VALIDATED_THRESHOLD:
+            notes.append(f"CLASSIFIER_THRESHOLD={threshold:g} is not the {VALIDATED_THRESHOLD:.2f} that the held-out test validated; "
+                         "results at another threshold have not been measured")
+
         return cls(
             foundry_endpoint=foundry_endpoint,
             foundry_api_key=foundry_key,
@@ -229,6 +257,9 @@ class Settings:
             decision1_auth=auth,
             decision1_timeout=_number(environ, "DECISION1_TIMEOUT", 20.0, float, 1.0, notes),
             decision1_max_attempts=_number(environ, "DECISION1_MAX_ATTEMPTS", 3, int, 1, notes),
+            classifier_enabled=_flag(environ, "CLASSIFIER_ENABLED", False, notes),
+            classifier_required=_flag(environ, "CLASSIFIER_REQUIRED", False, notes),
+            classifier_threshold=threshold,
             scan_max_files=_number(environ, "SCAN_MAX_FILES", 50, int, 1, notes),
             scan_max_file_bytes=_number(environ, "SCAN_MAX_FILE_BYTES", 200_000, int, 1, notes),
             scan_max_total_bytes=_number(environ, "SCAN_MAX_TOTAL_BYTES", 1_000_000, int, 1, notes),
@@ -275,6 +306,10 @@ class Settings:
             f"  model version .. {self.decision1_model_version}   (reported in results as Microsoft-Decision-1@{self.decision1_model_version})",
             f"  sign-in ........ {auth}",
             f"  timeout ........ {self.decision1_timeout:g} s per attempt, {self.decision1_max_attempts} attempts",
+            ("Decision-1 in scans: ON, at probability " + f"{self.classifier_threshold:.2f} or higher; "
+             + ("REQUIRED (if it is down, a scan that would pass becomes scan_failed)" if self.classifier_required
+                else "optional (if it is down, scans still finish on the rules and the report says so)"))
+            if self.classifier_enabled else "Decision-1 in scans: OFF (scans use the rules only)",
             "Scan limits",
             f"  files .......... {self.scan_max_files} per request, {self.scan_max_file_bytes} bytes per file, {self.scan_max_total_bytes} bytes in total",
         ]
@@ -394,6 +429,21 @@ def demo() -> None:
     assert Settings.from_env({"FOUNDRY_ENDPOINT": host, "DECISION1_AUTH": "ENTRA"}).problems() == []   # Entra needs no key
     assert any("https" in p for p in Settings.from_env({"FOUNDRY_ENDPOINT": "http://example.com", "FOUNDRY_API_KEY": "k"}).problems())
     assert Settings.from_env({"FOUNDRY_ENDPOINT": "http://127.0.0.1:8080", "FOUNDRY_API_KEY": "k"}).problems() == []   # local test servers are fine
+
+    # --- the classifier switches: off by default, parsed forgivingly, the validated threshold flagged when changed
+    off = Settings.from_env(base)
+    assert (off.classifier_enabled, off.classifier_required, off.classifier_threshold) == (False, False, 0.70) and off.warnings == ()
+    assert "Decision-1 in scans: OFF" in off.describe()
+    for raw, expected in (("true", True), ("TRUE", True), ("1", True), ("yes", True), ("on", True), ("false", False), ("0", False), ("off", False)):
+        assert Settings.from_env({**base, "CLASSIFIER_ENABLED": raw}).classifier_enabled is expected, raw
+    on = Settings.from_env({**base, "CLASSIFIER_ENABLED": "true", "CLASSIFIER_REQUIRED": "true"})
+    assert on.classifier_enabled and on.classifier_required and "ON, at probability 0.70" in on.describe() and "REQUIRED" in on.describe()
+    assert "optional" in Settings.from_env({**base, "CLASSIFIER_ENABLED": "true"}).describe()
+    odd = Settings.from_env({**base, "CLASSIFIER_ENABLED": "maybe", "CLASSIFIER_THRESHOLD": "0.85"})
+    assert odd.classifier_enabled is False and odd.classifier_threshold == 0.85 and len(odd.warnings) == 2
+    assert any("not the 0.70" in w for w in odd.warnings)
+    assert Settings.from_env({**base, "CLASSIFIER_THRESHOLD": "1.5"}).classifier_threshold == 0.70
+    assert Settings.from_env({**base, "CLASSIFIER_THRESHOLD": "soon"}).classifier_threshold == 0.70
 
     # --- placeholders are caught before any call is made (the most common mistake after copying .env.example)
     assert any("placeholder YOUR-RESOURCE" in p for p in Settings.from_env({"FOUNDRY_ENDPOINT": "https://YOUR-RESOURCE.services.ai.azure.com", "FOUNDRY_API_KEY": "k" * 32}).problems())
