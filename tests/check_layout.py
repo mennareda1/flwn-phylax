@@ -45,6 +45,8 @@ EXPECTED_HOME = {
     "undefined_names": "security_service/core/verification.py",
     "apply_unified_diff": "security_service/core/patching.py",
     "format_report": "security_service/scan.py",
+    "expand": "security_service/paths.py",
+    "expand": "security_service/paths.py",
     "create_app": "security_service/api/app.py",
     "Gateway": "security_service/api/gateway.py",
     "JobStore": "security_service/api/jobs.py",

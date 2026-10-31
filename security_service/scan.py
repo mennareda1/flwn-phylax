@@ -5,6 +5,7 @@ Scan files from the command line, with the engines your settings switch on, and 
 
     python -m security_service.scan app.py
     python -m security_service.scan src\\a.py src\\b.py
+    python -m security_service.scan src                  a whole folder: every .py file in it, except venv, .git, build and the like
     python -m security_service.scan app.py --json        the full machine-readable report instead
 
 Settings come from your terminal and .env, as everywhere else (python -m security_service.config shows them). With
@@ -27,6 +28,7 @@ from pathlib import Path
 from security_service.config import Settings, load_env_file
 from security_service.core.files import InvalidScanInput, SourceFile
 from security_service.core.scan_service import ScanService
+from security_service.paths import PathProblem, expand
 
 EXIT_CODES = {"pass": 0, "review_required": 1, "block": 2, "scan_failed": 3}
 COULD_NOT_START = 4
@@ -47,7 +49,8 @@ def format_report(report) -> str:
     else:
         lines.append("findings: none")
     c = data["coverage"]
-    lines.append("coverage: scanned " + (", ".join(c["files_scanned"]) or "nothing")
+    scanned = c["files_scanned"]
+    lines.append("coverage: scanned " + ((", ".join(scanned) if len(scanned) <= 8 else f"{len(scanned)} files") or "nothing")
                  + "; engines that ran: " + (", ".join(c["analyzers_run"]) or "none")
                  + ("; engines that failed: " + "; ".join(f"{k} ({v[:80]})" for k, v in c["analyzers_failed"].items()) if c["analyzers_failed"] else "")
                  + ("; skipped: " + ", ".join(f"{s['path']} ({s['reason']})" for s in c["skipped_files"]) if c["skipped_files"] else ""))
@@ -63,16 +66,24 @@ def main(argv: list[str], environ=None, classifier=None, out=print) -> int:
     if environ is None:
         load_env_file()
         environ = os.environ
-    files = []
-    for path in paths:
-        try:
-            files.append(SourceFile(path.replace("\\", "/"), Path(path).read_text(encoding="utf-8", errors="replace")))
-        except OSError as problem:
-            out(f"Cannot read {path}: {problem.strerror or problem}")
-            return COULD_NOT_START
     settings = Settings.from_env(environ)
     for warning in settings.warnings:
         out(f"warning: {warning}")
+    try:
+        located = expand(paths)
+    except PathProblem as problem:
+        out(str(problem))
+        return COULD_NOT_START
+    if len(located) > settings.scan_max_files:
+        out(f"Found {len(located)} Python files, and one scan takes at most {settings.scan_max_files} (SCAN_MAX_FILES in .env). Give a smaller folder, or raise the limit.")
+        return COULD_NOT_START
+    files = []
+    for file, label in located:
+        try:
+            files.append(SourceFile(label, file.read_text(encoding="utf-8", errors="replace")))
+        except OSError as problem:
+            out(f"Cannot read {label}: {problem.strerror or problem}")
+            return COULD_NOT_START
     try:
         service = ScanService.from_settings(settings, classifier=classifier)
         report = service.scan(files)
@@ -107,6 +118,27 @@ def demo() -> None:
         assert main([str(good)], environ=off, out=say) == 0 and "decision: pass" in "\n".join(shown) and "findings: none" in "\n".join(shown)
         shown.clear()
         assert main([str(good), str(odd)], environ=off, out=say) == 0 and "notes.md (unsupported_language)" in "\n".join(shown)   # skipped files are listed
+        shown.clear()
+
+        # a FOLDER: every .py file in it, junk folders skipped, files named relative to the folder, a long list of files summarized
+        tree = Path(folder) / "project"
+        (tree / "pkg").mkdir(parents=True)
+        (tree / "venv").mkdir()
+        (tree / "pkg" / "net.py").write_text(bad.read_text(encoding="utf-8"), encoding="utf-8")
+        (tree / "pkg" / "ok.py").write_text(good.read_text(encoding="utf-8"), encoding="utf-8")
+        (tree / "venv" / "skip.py").write_text(bad.read_text(encoding="utf-8"), encoding="utf-8")
+        assert main([str(tree)], environ=off, out=say) == 2
+        text = "\n".join(shown)
+        assert "pkg/net.py:4" in text and "scanned pkg/net.py, pkg/ok.py" in text and "skip.py" not in text
+        shown.clear()
+        for number in range(10):
+            (tree / "pkg" / f"m{number}.py").write_text("x = 1\n", encoding="utf-8")
+        assert main([str(tree)], environ=off, out=say) == 2 and "coverage: scanned 12 files;" in "\n".join(shown)                 # many files: counted, not listed
+        shown.clear()
+        assert main([str(tree)], environ={"SCAN_MAX_FILES": "5"}, out=say) == COULD_NOT_START and "Found 12 Python files" in shown[-1] and "SCAN_MAX_FILES" in shown[-1]
+        shown.clear()
+        (Path(folder) / "empty").mkdir()
+        assert main([str(Path(folder) / "empty")], environ=off, out=say) == COULD_NOT_START and "No Python files found" in shown[-1]
         shown.clear()
 
         # --json is the full report

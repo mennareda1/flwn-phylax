@@ -385,7 +385,8 @@ def run() -> None:
             assert "scan: block" in text and "command_injection" in text and "VERIFICATION: passed" in text and "RESULT: a verified fix was produced" in text
             assert "model use: 1 request(s), 480 tokens in, 2100 out (1900 thinking)" in text and GOOD_KEY not in text
             assert sample_file.read_text(encoding="utf-8") == original_text                                   # the user's file is never touched
-            assert apply_unified_diff(original_text, saved.read_text(encoding="utf-8"), sample_path.replace("\\", "/")) == \
+            assert saved.read_text(encoding="utf-8").startswith("--- a/net.py\n+++ b/net.py\n")                  # a path the user typed in full is never written into the patch
+            assert apply_unified_diff(original_text, saved.read_text(encoding="utf-8"), "net.py") == \
                 original_text.replace('    os.system("ping " + host)\n', '    subprocess.run(["ping", host], check=True)\n').replace("import os\n", "import os\nimport subprocess\n")
             asked = server.requests[before:]
             assert len(asked) == 1 and asked[0]["path"] == "/openai/v1/chat/completions"                       # one model request; rules only, so Decision-1 was not called

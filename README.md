@@ -61,6 +61,7 @@ what a test does.
 ## Verified fixes
 
     python -m security_service.fix app.py                          # scan, ask for a fix, verify it, print everything
+    python -m security_service.fix src                             # a whole folder: every .py file in it (venv, .git, build... are skipped); at most 10 files are fixed per run
     python -m security_service.fix app.py --save-patch fix.diff    # also save the VERIFIED patch, then:  git apply fix.diff
 
 It scans the files, asks the corrector (GPT-6 Astra) for a patch per file, and verifies each patch before calling it applicable:
@@ -71,6 +72,10 @@ It scans the files, asks the corrector (GPT-6 Astra) for a patch per file, and v
   `rescan`: the changed files are scanned again with the same engines, every requested finding must be gone and nothing new that a rule
   backs may appear (a new suspicion only a model has is listed for review, because a model alone never blocks);
 - the outcome is `passed`, `failed`, or `inconclusive` (the re-scan could not run: never treated as passed); only `passed` is applicable.
+
+Files and folders both work (`python -m security_service.scan src` scans a whole folder). Files are named in reports and patches relative to the folder you run the command in (else the git repository root, else the folder you named), never with a drive letter or an absolute path, so `git apply fix.diff` works from that folder.
+
+Give it files or a whole folder (`python -m security_service.fix src --save-patch fix.diff`): a folder is searched for `.py` files, skipping `.git`, `venv`, `node_modules`, `build` and the like. Files are named relative to the folder you run it in (else the git root, else the folder you named), never by a full path, so the saved patch applies with `git apply` from that folder. At most 10 files are fixed per run, most severe first.
 
 It never changes your files: you read the patch and apply it. A patch that failed verification is shown and, by default, not saved; `--save-unverified FILE` keeps it for review, marked UNVERIFIED inside the file. "Not confirmed" is not "wrong": a rule-based re-scan cannot confirm every correct fix (for example Bandit's SQL rule flags any query built with an f-string, even with a trusted table name), so a failed check names the rule and line that still fire, and the model is told what the re-scan looks for. Findings it did
 not fix are listed (NOT FIXED) with the reason. A hardcoded secret is never fixed automatically: remove it and rotate it.
@@ -149,6 +154,7 @@ questions, and each category at or above the threshold becomes a finding in the 
 Try it on a file, switch off and on (PowerShell):
 
     python -m security_service.scan app.py                                       # rules only, the default
+    python -m security_service.scan src                                          # a whole folder
     $env:CLASSIFIER_ENABLED = "true"; python -m security_service.scan app.py     # Decision-1 as well
 
 The exit code says what happened: 0 pass, 1 review_required, 2 block, 3 scan_failed, 4 could not start.

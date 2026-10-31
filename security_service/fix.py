@@ -5,6 +5,7 @@ Ask for verified fixes for your own files, from the command line, and read them 
 
     python -m security_service.fix app.py
     python -m security_service.fix src\\a.py src\\b.py --save-patch fix.diff
+    python -m security_service.fix src --save-patch fix.diff     a whole folder (at most 10 files are fixed per run, most severe first)
     python -m security_service.fix app.py --finding f1,f3        only these findings, by the ids a scan printed
     python -m security_service.fix app.py --save-unverified fix.diff   also keep a patch that was NOT confirmed, marked UNVERIFIED inside the file
     python -m security_service.fix app.py --json                 the full machine-readable result
@@ -36,6 +37,7 @@ from security_service.config import Settings, load_env_file
 from security_service.core.files import InvalidScanInput, SourceFile
 from security_service.core.fix_service import FixService
 from security_service.core.scan_service import ScanService
+from security_service.paths import PathProblem, expand
 from security_service.core.schema import Severity
 from security_service.ports.corrector import CorrectorError
 
@@ -63,12 +65,20 @@ def main(argv: list[str], environ=None, out=print, corrector=None, scan_service=
         if problems:
             out("The corrector is not ready:\n" + "\n".join(f"  - {p}" for p in problems) + "\nAdd the missing setting to .env, then run  python -m tests.live_corrector  to check it.")
             return COULD_NOT_START
+    try:
+        located = expand(paths)
+    except PathProblem as problem:
+        out(str(problem))
+        return COULD_NOT_START
+    if len(located) > settings.scan_max_files:
+        out(f"Found {len(located)} Python files, and one scan takes at most {settings.scan_max_files} (SCAN_MAX_FILES in .env). Give a smaller folder, or raise the limit.")
+        return COULD_NOT_START
     files = []
-    for path in paths:
+    for file, label in located:
         try:
-            files.append(SourceFile(path.replace("\\", "/"), Path(path).read_text(encoding="utf-8", errors="replace")))
+            files.append(SourceFile(label, file.read_text(encoding="utf-8", errors="replace")))
         except OSError as problem:
-            out(f"Cannot read {path}: {problem.strerror or problem}")
+            out(f"Cannot read {label}: {problem.strerror or problem}")
             return COULD_NOT_START
     try:
         limit = int(_value(argv, "--max-lines") or 40)
@@ -133,7 +143,8 @@ def main(argv: list[str], environ=None, out=print, corrector=None, scan_service=
     if result.applicable and saved:
         Path(saved).write_text(diff_text, encoding="utf-8", newline="\n")
         if not as_json:
-            out(f"\nSaved the verified patch to {saved}. Read it, then apply it yourself:  git apply {saved}")
+            out(f"\nSaved the verified patch to {saved}. Read it, then apply it yourself, from the folder you ran this in:  git apply --check {saved}  (a dry run), then  git apply {saved}")
+            out("If git says \"patch does not apply\" on files with Windows line endings, add --ignore-whitespace.")
     elif saved and not as_json:
         out("\nNot saved: a patch is saved only when it passed verification. To keep it for review anyway, use --save-unverified FILE (it is marked UNVERIFIED inside the file).")
     if unverified:
@@ -153,6 +164,7 @@ def main(argv: list[str], environ=None, out=print, corrector=None, scan_service=
     if result.applicable:
         out("\nRESULT: a verified fix was produced. Nothing was changed: you apply it after reading it." if not result.unfixed else
             "\nRESULT: a verified fix was produced for the findings it covers (see NOT FIXED above for the rest). Nothing was changed: you apply it after reading it.")
+        out("Verification shows the problem is gone and nothing new appeared. It does NOT prove the code behaves the same: run your tests, and look for anything that reads data an older version wrote.")
         return 0
     out(f"\nRESULT: no verified fix. {result.failure_reason}")
     if result.patches:
@@ -201,8 +213,8 @@ def demo() -> None:
         assert "scan: block" in text and "command_injection" in text and "PATCH for" in text and "+    subprocess.run" in text
         assert "VERIFICATION: passed" in text and "scope" in text and "rescan" in text and "RESULT: a verified fix was produced" in text and "model use: 1 request" in text
         assert net.read_bytes() == before, "the tool changed the user's file"
-        assert apply_unified_diff(bad, patch_file.read_text(encoding="utf-8"), net.as_posix()) == bad.replace('    os.system("ping " + host)\n', fixed_call).replace("import os\n", "import os\nimport subprocess\n")
-        assert f"git apply {patch_file}" in text
+        assert apply_unified_diff(bad, patch_file.read_text(encoding="utf-8"), "net.py") == bad.replace('    os.system("ping " + host)\n', fixed_call).replace("import os\n", "import os\nimport subprocess\n")
+        assert f"git apply {patch_file}" in text and "--ignore-whitespace" in text and "does NOT prove the code behaves the same" in text
         shown.clear()
 
         # a patch that does not verify is shown, NOT saved, and the result says why
@@ -228,7 +240,7 @@ def demo() -> None:
         assert body.startswith("# UNVERIFIED PATCH: Phylax could not confirm this fix.") and "NOT CONFIRMED, not necessarily wrong" in body and "git ignores" in body
         assert "marked UNVERIFIED" in "\n".join(shown) and net.read_bytes() == before
         raw_diff = body[body.index("--- a/"):]
-        assert 'eval("ping " + host)' in raw_diff and apply_unified_diff(bad, raw_diff, net.as_posix()).count("eval(") == 1       # the diff after the notice is a normal, strict diff
+        assert 'eval("ping " + host)' in raw_diff and apply_unified_diff(bad, raw_diff, "net.py").count("eval(") == 1       # the diff after the notice is a normal, strict diff
         shown.clear()
         verified_copy = Path(folder) / "verified_copy.diff"                                         # a verified patch saved this way has NO unverified notice
         assert main([str(net), "--save-unverified", str(verified_copy)], environ=ready, out=say, corrector=Corrector()) == 0
@@ -244,12 +256,31 @@ def demo() -> None:
         shown.clear()
         assert main([str(net)], environ={}, out=say) == COULD_NOT_START and "No deployment" in "\n".join(shown) and "live_corrector" in "\n".join(shown)
         shown.clear()
-        assert main([str(Path(folder) / "missing.py")], environ=ready, out=say, corrector=Corrector()) == COULD_NOT_START and "Cannot read" in shown[-1]
+        assert main([str(Path(folder) / "missing.py")], environ=ready, out=say, corrector=Corrector()) == COULD_NOT_START and "Cannot read" in shown[-1] and "No such file or folder" in shown[-1]
         assert main([], environ=ready, out=say) == COULD_NOT_START and "Usage" in shown[-1]
         for bad_limit in ("0", "500", "many"):
             assert main([str(net), "--max-lines", bad_limit], environ=ready, out=say, corrector=Corrector()) == COULD_NOT_START and "--max-lines" in shown[-1]
         assert main([str(net), "--finding", "f9"], environ=ready, out=say, corrector=Corrector()) == COULD_NOT_START and "not in the scan" in shown[-1]
         assert "Traceback" not in "\n".join(shown)
+        shown.clear()
+
+        # a FOLDER works: every .py file in it (not venv, not __pycache__), labelled relative paths, and the patch header carries no absolute path
+        tree = Path(folder) / "project"
+        (tree / "pkg").mkdir(parents=True)
+        (tree / "venv").mkdir()
+        (tree / "pkg" / "net.py").write_text(bad, encoding="utf-8")
+        (tree / "pkg" / "ok.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        (tree / "venv" / "skip.py").write_text(bad, encoding="utf-8")
+        folder_patch = Path(folder) / "folder.diff"
+        folder_run = Corrector()
+        assert main([str(tree), "--save-patch", str(folder_patch)], environ=ready, out=say, corrector=folder_run) == 0 and folder_run.usage["calls"] == 1
+        text = "\n".join(shown)
+        assert "pkg/net.py:5" in text and "venv" not in text and "skip.py" not in text                  # the venv folder was not searched; the file is named relative to the folder given
+        saved_text = folder_patch.read_text(encoding="utf-8")
+        assert saved_text.startswith("--- a/pkg/net.py\n+++ b/pkg/net.py\n") and str(folder) not in saved_text and ":" not in saved_text.splitlines()[0]
+        shown.clear()
+        (Path(folder) / "emptydir").mkdir()
+        assert main([str(Path(folder) / "emptydir")], environ=ready, out=say, corrector=Corrector()) == COULD_NOT_START and "No Python files found" in shown[-1]
         shown.clear()
 
         # --finding picks by id, --max-lines is passed on, and --json is the whole result

@@ -38,6 +38,8 @@ CHECKS = [
     "security_service.core.verification",
     "security_service.core.fix_service",
     "security_service.fix --selftest",
+    "security_service.paths",
+    "security_service.paths",
     "security_service.scan --selftest",
     "security_service.api.auth",
     "security_service.api.ratelimit",

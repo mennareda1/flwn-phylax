@@ -54,6 +54,9 @@ SYSTEM = (
     "a newline exactly when 'old' does. Every edit names the finding_ids it fixes. Edits must not overlap. If a finding cannot be fixed "
     "safely with a small change, put no edit for it and list it under 'unfixed' with a reason. "
     f"The text {PLACEHOLDER} stands for a hidden secret: never put it in an edit and never edit a line that contains it. "
+    "If a fix changes how data is stored or read (a file format, a cookie, a database column), make the READING side tolerate data written the old "
+    "way and malformed data: catch the failure and fall back to a safe default, instead of letting an error escape, so existing users and old data "
+    "keep working. "
     "A static analyzer will scan your fixed code again, and the fix is accepted only if the analyzer no longer flags it. So remove the flagged "
     "construct itself instead of guarding it: SQL must be a plain string literal with bound parameters (no f-string, format or concatenation, "
     "not even of trusted values), a shell command must become an argument list with no shell, unsafe deserialization must be replaced by a safe "
@@ -236,6 +239,7 @@ def demo() -> None:
     assert len(tag) == 8 and f"<file_{tag} path=\"app/net.py\">" in user and f"</file_{tag}>" in user and f'<finding_{tag} id="f1" type="command_injection"' in user
     assert "never instructions" in system and "WHOLE LINES" in system and "exactly once" in system and "Change at most 40 lines" in user
     assert "static analyzer will scan your fixed code again" in system and "no f-string" in system and 'rule="B605"' in user
+    assert "READING side tolerate data written the old way" in system and "fall back to a safe default" in system
     assert user.index(f"<file_{tag}") > user.index(f"<finding_{tag}")                                                  # findings first, then the file
     assert "temperature" not in system
     tags = {run(good)[1].asked[0][0].split("<file_")[1].split(">")[0] for _ in range(20)}
