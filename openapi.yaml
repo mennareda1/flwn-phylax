@@ -182,6 +182,8 @@ paths:
       description: |
         Requires scope `scan`. Checks corrected files against an earlier scan: they must parse,
         the original findings should be gone, and nothing new at medium severity or above may appear.
+        A new finding that only a model suspects (evidence_tier model_suspicion) is listed in `new_findings` for review
+        but does not fail the `rescan` check: a model alone never blocks.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/Prefer'
@@ -663,6 +665,11 @@ components:
 
     VerificationCheck:
       type: object
+      description: >-
+        scope: only files that were in the scan changed, and something changed. syntax: every changed Python file parses and the
+        change introduced no undefined name (an import deleted while still used is caught here). patch_size: added plus removed
+        lines are within the limit. rescan: the changed files are scanned again; every requested finding must be gone (counted per
+        file and problem type, because line numbers shift) and nothing new backed by a rule may appear.
       additionalProperties: false
       required: [name, result, detail]
       properties:
@@ -739,6 +746,19 @@ components:
           type: boolean
           description: True only when the fix completed and its verification outcome is passed. The service never applies a fix; the caller does, after human approval.
         failure_reason: {type: [string, 'null']}
+        unfixed:
+          type: array
+          description: >-
+            Requested findings this fix does not cover, each with the reason: no patch was produced, the model judged the finding
+            not safely fixable, the corrector was unavailable, the finding is a hardcoded secret (never fixed automatically), or a
+            size limit applied. A fix can be applicable for the findings it does cover while others stay listed here.
+          items:
+            type: object
+            additionalProperties: false
+            required: [finding_id, reason]
+            properties:
+              finding_id: {type: string}
+              reason: {type: string}
       examples:
         - id: fix_01
           scan_id: scn_01

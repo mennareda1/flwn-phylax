@@ -363,6 +363,45 @@ def run() -> None:
             code, text = contact(CORRECTOR_REASONING_EFFORT="none")                                    # a value Astra refuses is replaced, with a warning
             assert code == 0 and "warning: CORRECTOR_REASONING_EFFORT='none'" in text and server.requests[-1]["body"]["reasoning_effort"] == "low"
 
+            # 9d. the fix tool, end to end: the real rules engine, the real corrector adapter, real HTTP to a fake GPT-6 Astra, real verification
+            from security_service import fix as fix_tool
+            from security_service.core.patching import apply_unified_diff
+
+            original_text = live_corrector.SAMPLES["ping"].content
+            sample_file = Path(folder) / "net.py"
+            sample_file.write_text(original_text, encoding="utf-8")
+            sample_path = str(sample_file)
+
+            def repair(*flags, **env):
+                lines: list[str] = []
+                base_env = {"FOUNDRY_ENDPOINT": full_url, "FOUNDRY_API_KEY": GOOD_KEY, "CORRECTOR_DEPLOYMENT": "gpt-6-astra"}
+                code = fix_tool.main([sample_path, *flags], environ={**base_env, **env}, out=lines.append)
+                return code, "\n".join(lines)
+
+            saved = Path(folder) / "fix.diff"
+            before = len(server.requests)
+            code, text = repair("--save-patch", str(saved))
+            assert code == 0, text
+            assert "scan: block" in text and "command_injection" in text and "VERIFICATION: passed" in text and "RESULT: a verified fix was produced" in text
+            assert "model use: 1 request(s), 480 tokens in, 2100 out (1900 thinking)" in text and GOOD_KEY not in text
+            assert sample_file.read_text(encoding="utf-8") == original_text                                   # the user's file is never touched
+            assert apply_unified_diff(original_text, saved.read_text(encoding="utf-8"), sample_path.replace("\\", "/")) == \
+                original_text.replace('    os.system("ping " + host)\n', '    subprocess.run(["ping", host], check=True)\n').replace("import os\n", "import os\nimport subprocess\n")
+            asked = server.requests[before:]
+            assert len(asked) == 1 and asked[0]["path"] == "/openai/v1/chat/completions"                       # one model request; rules only, so Decision-1 was not called
+            assert "<REDACTED_SECRET>" not in asked[0]["body"]["messages"][1]["content"] and original_text in asked[0]["body"]["messages"][1]["content"]
+
+            for deployment, expected in (("unsafe", "Still present after the change: f1 (command_injection"), ("swapped", "new finding n1: code_injection"),
+                                         ("badedit", "BadProposal"), ("truncated", "whole output budget"), ("notjson", "not a JSON object"),
+                                         ("missing", "CORRECTOR_DEPLOYMENT")):
+                refused_patch = Path(folder) / f"{deployment}.diff"
+                code, text = repair("--save-patch", str(refused_patch), CORRECTOR_DEPLOYMENT=deployment)
+                assert code == 3 and expected in text and "RESULT: no verified fix" in text, (deployment, text)
+                assert not refused_patch.exists() and sample_file.read_text(encoding="utf-8") == original_text, deployment      # nothing saved, nothing changed
+            code, text = repair(FOUNDRY_API_KEY="the-wrong-key-12345")
+            assert code == 3 and "authentication failed" in text and "the-wrong-key-12345" not in text
+            assert repair("--finding", "f9")[0] == 4 and repair(CORRECTOR_DEPLOYMENT="")[0] == 4              # a bad id, and a missing setting, never reach the model
+
             # 10. the program itself: `python -m tests.live_decision1` configured only by a .env file
             clean = {k: v for k, v in os.environ.items() if k not in VARIABLES}
             done = subprocess.run([sys.executable, "-m", "tests.live_decision1"], cwd=REPO_ROOT, capture_output=True, text=True,
@@ -429,6 +468,11 @@ def run() -> None:
             as_program = subprocess.run([sys.executable, "-m", "tests.live_corrector"], cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8",
                                         env={**clean, "SECURITY_ENV_FILE": str(corrector_env)}, timeout=120)
             assert as_program.returncode == 0 and "the fix is usable end to end" in as_program.stdout and GOOD_KEY not in as_program.stdout + as_program.stderr, as_program.stdout + as_program.stderr
+
+            # 10d. the fix tool as a program, from a .env file
+            fixed_by_program = subprocess.run([sys.executable, "-m", "security_service.fix", sample_path], cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8",
+                                              env={**clean, "SECURITY_ENV_FILE": str(corrector_env)}, timeout=120)
+            assert fixed_by_program.returncode == 0 and "VERIFICATION: passed" in fixed_by_program.stdout and GOOD_KEY not in fixed_by_program.stdout + fixed_by_program.stderr, fixed_by_program.stdout + fixed_by_program.stderr
 
             # ...a variable in the terminal beats the file: a wrong key in the terminal must fail, even though the file has the right one
             override = subprocess.run([sys.executable, "-m", "tests.live_decision1"], cwd=REPO_ROOT, capture_output=True, text=True,

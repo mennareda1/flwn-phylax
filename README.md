@@ -58,6 +58,24 @@ A `.env` file is read only by entry points (`tests.live_decision1`, `security_se
 the HTTP service). Library code and the automated checks never read it, so a real `.env` cannot change
 what a test does.
 
+## Verified fixes
+
+    python -m security_service.fix app.py                          # scan, ask for a fix, verify it, print everything
+    python -m security_service.fix app.py --save-patch fix.diff    # also save the VERIFIED patch, then:  git apply fix.diff
+
+It scans the files, asks the corrector (GPT-6 Astra) for a patch per file, and verifies each patch before calling it applicable:
+
+- the diff is applied, strictly (no fuzz), to the exact file that was scanned, and what is verified is exactly the text a client will get;
+- `scope`: only files of the scan changed; `syntax`: the code parses and uses no NEW undefined name (an import deleted while still used
+  parses fine and passes a re-scan, then crashes: this catches it); `patch_size`: within `--max-lines` (default 40);
+  `rescan`: the changed files are scanned again with the same engines, every requested finding must be gone and nothing new that a rule
+  backs may appear (a new suspicion only a model has is listed for review, because a model alone never blocks);
+- the outcome is `passed`, `failed`, or `inconclusive` (the re-scan could not run: never treated as passed); only `passed` is applicable.
+
+It never changes your files: you read the patch and apply it. A patch that failed verification is shown but never saved. Findings it did
+not fix are listed (NOT FIXED) with the reason. A hardcoded secret is never fixed automatically: remove it and rotate it.
+This is not yet in the HTTP service (fixes there still answer `501`); the contract (1.1.0) already defines it.
+
 ## The corrector (GPT-6 Astra)
 
 The corrector turns a finding into a proposed fix. It is built and tested, and has been run only against a test double until you
@@ -224,9 +242,11 @@ Run against the real service: Decision-1 (sign-in, request, reply, and the held-
 
 Not yet run against a real model: the LLM detector and the Foundry adapter.
 
-Built, not yet run for real: the corrector adapter for GPT-6 Astra (run `python -m tests.live_corrector` to make the first call).
+Run against the real GPT-6 Astra: the corrector (`python -m tests.live_corrector`, both routes, a verified fix).
 
-Not built yet: the fix and verification services behind the 501s, the fix-quality test, the Flwn side of the
+Built and tested against a test double only: the fix service and the verification service (`python -m security_service.fix`), until you run them on your own files.
+
+Not built yet: the fix and verification endpoints in the HTTP service (they answer `501`), the fix-quality test, the Flwn side of the
 integration, chunking of large files for the model, a persistent job store and a shared rate limiter for running several
 instances, TLS, and the C++, C# and JS lanes.
 
@@ -274,6 +294,9 @@ instances, TLS, and the C++, C# and JS lanes.
   The cost is that it is one instance only; a persistent store is a later, deliberate step.
 - An engine that raises instead of returning its failure is treated as a failed engine, never as a crashed scan, and only
   the type of its exception is recorded (the message may contain code).
+- GPT-6 Astra may process submitted code globally (decided by the project owner, 2026-10-31): the corrector is allowed on a Global Standard
+  deployment, so code leaves the EU for fixes. Secrets are masked before it leaves. Flwn's own terms to its customers should say so.
+- A fix is applicable only when verification PASSED; a re-scan that cannot run is inconclusive, never a pass. Nothing is ever applied by Phylax.
 - The corrector asks for exact whole-line edits, not a rewritten file; anything that does not fit the file exactly is refused.
   It never applies a patch. A fix is offered only after the fix service parses and re-scans it, and a person still approves.
 - A secret found by pattern asks for human review but never blocks on its own: a pattern cannot tell a

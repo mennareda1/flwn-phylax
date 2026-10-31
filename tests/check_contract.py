@@ -116,6 +116,55 @@ def run() -> None:
     assert model_report.to_dict()["findings"][0]["evidence_tier"] == "model_suspicion"
     assert {"role": "classifier", "name": "decision-stand-in"} in model_report.to_dict()["provenance"]["engines"]
     check("Capabilities", with_model.capabilities())
+
+    # real fix results (a real scan, a scripted corrector), wrapped the way the API will wrap them, must match Fix and Verification:
+    # one that passes, one that fails with a new finding, and one with nothing fixed and a reason
+    from security_service.core.fix_service import FixService
+    from security_service.core.patching import make_unified_diff
+    from security_service.core.schema import Finding
+    from security_service.ports.corrector import Patch
+
+    stamp = "2026-10-31T12:00:00Z"
+    unsafe = "import os\n\ndef ping(host):\n    os.system('ping ' + host)\n    return True\n"
+    fixer = ScanService([BanditAnalyzer(), SecretsAnalyzer()], limits=Limits(max_files=10, max_file_bytes=5000, max_total_bytes=20000))
+
+    class Scripted:
+        role, name = "corrector", "scripted"
+
+        def __init__(self, replacement):
+            self.replacement = replacement
+
+        def propose_fix(self, file, findings, constraints):
+            new = file.content.replace("    os.system('ping ' + host)\n", self.replacement).replace("import os\n", "import os\nimport subprocess\n")
+            return [Patch(file.path, tuple(f.id for f in findings), make_unified_diff(file.path, file.content, new), "Replaced the shell call.")] if new != file.content else []
+
+    def as_fix(result):
+        data = result.to_dict()
+        if data["verification"]:
+            data["verification"] = {"id": "ver_1", "scan_id": "scn_1", "status": "completed", "created_at": stamp, "completed_at": stamp, **data["verification"]}
+        return {"id": "fix_1", "scan_id": "scn_1", "status": "completed", "created_at": stamp, "completed_at": stamp, **data}
+
+    source = [SourceFile("app/net.py", unsafe)]
+    baseline = fixer.scan(source).findings
+    passing = FixService(fixer, Scripted("    subprocess.run(['ping', host], check=True)\n")).fix(source, baseline)
+    assert passing.applicable and passing.verification.outcome == "passed"
+    check("Fix", as_fix(passing))
+    check("Verification", as_fix(passing)["verification"])
+    swapped = FixService(fixer, Scripted("    eval('ping ' + host)\n")).fix(source, baseline)
+    assert not swapped.applicable and swapped.verification.outcome == "failed" and swapped.verification.new_findings
+    check("Fix", as_fix(swapped))
+    check("Verification", as_fix(swapped)["verification"])
+    class Silent:
+        role, name = "corrector", "silent"
+
+        def propose_fix(self, file, findings, constraints):
+            return []
+
+    nothing = FixService(fixer, Silent()).fix(source, baseline)                                             # the model proposes nothing
+    assert nothing.patches == () and nothing.unfixed and nothing.failure_reason
+    check("Fix", as_fix(nothing))
+    rejects("Fix", {**as_fix(passing), "surprise": 1})                                                      # the contract is closed: unknown fields are errors
+    rejects("Fix", {**as_fix(nothing), "unfixed": [{"finding_id": "f1"}]})                                  # an unfixed entry needs its reason
     assert {"id": "python", "roles": ["analyzer", "classifier"]} in with_model.capabilities()["languages"]
     check("Capabilities", service.capabilities())
     check("Readiness", {"status": "ready", "checks": {"analyzers": "ok"}})
