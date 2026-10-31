@@ -25,6 +25,8 @@ CHECKS = [
     "security_service.adapters.secrets_check",
     "security_service.adapters.decision1",
     "security_service.adapters.classifier_detector",
+    "security_service.adapters.foundry_chat",
+    "security_service.adapters.foundry_corrector",
     "security_service.adapters.llm_detector",
     "security_service.core.redaction",
     "security_service.core.files",

@@ -37,6 +37,10 @@ screenshot it. `.env.example` is the committed template and contains placeholder
 | `CLASSIFIER_ENABLED` | no | `false` | `true` also asks Decision-1 about every Python file in a real scan (see below). |
 | `CLASSIFIER_REQUIRED` | no | `false` | `true` makes a Decision-1 outage turn a would-be pass into `scan_failed`. |
 | `CLASSIFIER_THRESHOLD` | no | `0.70` | Probability at or above which a category becomes a finding. 0.70 is what the held-out test validated. |
+| `CORRECTOR_DEPLOYMENT` | for fixes | none | The exact Name of the GPT-6 Astra deployment in Foundry (not the model's display name; no spaces). |
+| `CORRECTOR_ENDPOINT`, `CORRECTOR_API_KEY` | no | the Decision-1 ones | Only if Astra is in a different Foundry resource. |
+| `CORRECTOR_API` | no | `openai_v1` | Which route to call, `openai_v1` or `inference`; `tests.live_corrector --both` finds the one that works. |
+| `CORRECTOR_REASONING_EFFORT`, `CORRECTOR_MAX_OUTPUT_TOKENS`, `CORRECTOR_TIMEOUT_SECONDS` | no | `low`, `8000`, `180` | Cost controls: Astra's thinking is billed as output. |
 | `SERVICE_API_KEYS` | for the service | none | Who may call it: `name:scopes:key`, comma-separated. Make a key with `python -m security_service.api --new-key`. |
 | `SERVICE_HOST`, `SERVICE_PORT` | no | `127.0.0.1`, `8080` | Where it listens. `127.0.0.1` means this computer only. |
 | `SERVICE_RETENTION_HOURS` | no | `24` | How long submitted code and results are kept (in memory only). |
@@ -53,6 +57,34 @@ How settings are found, in order of priority:
 A `.env` file is read only by entry points (`tests.live_decision1`, `security_service.config`, and later
 the HTTP service). Library code and the automated checks never read it, so a real `.env` cannot change
 what a test does.
+
+## The corrector (GPT-6 Astra)
+
+The corrector turns a finding into a proposed fix. It is built and tested, and has been run only against a test double until you
+run the first real call (below). It is not yet connected to the HTTP service: fixes still answer `501` until the fix service,
+which verifies every patch, is built.
+
+First real call, with one line in `.env` (`CORRECTOR_DEPLOYMENT=<the Name of your Astra deployment>`; the endpoint and key are
+shared with Decision-1):
+
+    python -m tests.live_corrector            # one real request on the configured route
+    python -m tests.live_corrector --both     # try both routes, and say which to use
+
+It sends only a built-in sample, shows the model, the time, the tokens (thinking included), the cost and the patch, and checks
+the fix the way the fix service will: the patch fits the file, the patched code parses, and a re-scan shows the problem gone.
+
+How a fix is asked for, and why:
+- The model returns exact whole-line edits (`old` and `new`), not a rewritten file. That is cheaper (output is the expensive
+  part), and it makes the scope checkable: only the lines in `old` can change, each edit names the finding it fixes, and an
+  edit that does not match the file exactly, once, at the start of a line, is refused instead of guessed at.
+- The code and the findings sit inside tags with a random name per request, and the model is told they are data. Code cannot
+  forge the closing tag. This reduces prompt injection; it does not remove it. That is why the fix service re-scans the patched
+  code and a person approves every patch.
+- Secrets are masked before the code leaves, and an edit that touches a masked line is refused: removing a real secret is not
+  automated, and the secret must be rotated anyway.
+- Astra's rules, as we know them: `max_completion_tokens` (not `max_tokens`), no temperature, effort `low`/`medium`/`high`/`xhigh`,
+  no tools (those need the Responses API). Thinking counts against the output cap, so a cap that is too small gives an empty answer,
+  which is reported as such.
 
 ## The HTTP service
 
@@ -192,7 +224,9 @@ Run against the real service: Decision-1 (sign-in, request, reply, and the held-
 
 Not yet run against a real model: the LLM detector and the Foundry adapter.
 
-Not built yet: the corrector (GPT-6 Astra) and the fix and verification services behind the 501s, the Flwn side of the
+Built, not yet run for real: the corrector adapter for GPT-6 Astra (run `python -m tests.live_corrector` to make the first call).
+
+Not built yet: the fix and verification services behind the 501s, the fix-quality test, the Flwn side of the
 integration, chunking of large files for the model, a persistent job store and a shared rate limiter for running several
 instances, TLS, and the C++, C# and JS lanes.
 
@@ -240,6 +274,8 @@ instances, TLS, and the C++, C# and JS lanes.
   The cost is that it is one instance only; a persistent store is a later, deliberate step.
 - An engine that raises instead of returning its failure is treated as a failed engine, never as a crashed scan, and only
   the type of its exception is recorded (the message may contain code).
+- The corrector asks for exact whole-line edits, not a rewritten file; anything that does not fit the file exactly is refused.
+  It never applies a patch. A fix is offered only after the fix service parses and re-scans it, and a person still approves.
 - A secret found by pattern asks for human review but never blocks on its own: a pattern cannot tell a
   live key from the documented example key, and only HIGH confidence blocks. Masking is liberal (a
   missed secret leaks); reporting is careful (every report is an alarm). The known gap: a real secret

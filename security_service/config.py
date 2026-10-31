@@ -46,6 +46,8 @@ VARIABLES = (
     "DECISION1_ENDPOINT", "DECISION1_API_KEY", "DECISION1_DEPLOYMENT", "DECISION1_MODEL_VERSION",
     "DECISION1_AUTH", "DECISION1_TIMEOUT", "DECISION1_MAX_ATTEMPTS",
     "CLASSIFIER_ENABLED", "CLASSIFIER_REQUIRED", "CLASSIFIER_THRESHOLD",
+    "CORRECTOR_DEPLOYMENT", "CORRECTOR_ENDPOINT", "CORRECTOR_API_KEY", "CORRECTOR_API", "CORRECTOR_REASONING_EFFORT",
+    "CORRECTOR_MAX_OUTPUT_TOKENS", "CORRECTOR_TIMEOUT_SECONDS",
     "SERVICE_HOST", "SERVICE_PORT", "SERVICE_API_KEYS", "SERVICE_RETENTION_HOURS", "SERVICE_WORKERS",
     "SERVICE_RATE_LIMIT_PER_MINUTE", "SERVICE_MAX_WAIT_SECONDS",
     "SCAN_MAX_FILES", "SCAN_MAX_FILE_BYTES", "SCAN_MAX_TOTAL_BYTES",
@@ -219,6 +221,13 @@ class Settings:
     classifier_enabled: bool = False
     classifier_required: bool = False
     classifier_threshold: float = VALIDATED_THRESHOLD
+    corrector_deployment: str = ""
+    corrector_endpoint: str = ""        # empty = use FOUNDRY_ENDPOINT: Astra usually lives in the same Foundry resource as Decision-1
+    corrector_api_key: str = ""         # secret; empty = use FOUNDRY_API_KEY
+    corrector_api: str = "openai_v1"    # which route to call: openai_v1 or inference (tests/live_corrector.py finds out which works)
+    corrector_reasoning_effort: str = "low"
+    corrector_max_output_tokens: int = 8000
+    corrector_timeout: float = 180.0
     service_host: str = "127.0.0.1"
     service_port: int = 8080
     service_api_keys: str = ""          # secret: never printed, only counted and named
@@ -254,6 +263,14 @@ class Settings:
             notes.append(f"CLASSIFIER_THRESHOLD={threshold:g} is not the {VALIDATED_THRESHOLD:.2f} that the held-out test validated; "
                          "results at another threshold have not been measured")
 
+        corrector_api = _text(environ, "CORRECTOR_API", "openai_v1").lower()
+        if corrector_api not in ("openai_v1", "inference"):
+            notes.append(f"CORRECTOR_API={corrector_api!r} is not openai_v1 or inference; using openai_v1")
+            corrector_api = "openai_v1"
+        effort = _text(environ, "CORRECTOR_REASONING_EFFORT", "low").lower()
+        if effort not in ("low", "medium", "high", "xhigh"):
+            notes.append(f"CORRECTOR_REASONING_EFFORT={effort!r} is not low, medium, high or xhigh (GPT-6 Astra accepts no other value); using low")
+            effort = "low"
         service_port = _number(environ, "SERVICE_PORT", 8080, int, 1, notes)
         if service_port > 65535:
             notes.append(f"SERVICE_PORT={service_port} is not a valid port; using 8080")
@@ -274,6 +291,13 @@ class Settings:
             classifier_enabled=_flag(environ, "CLASSIFIER_ENABLED", False, notes),
             classifier_required=_flag(environ, "CLASSIFIER_REQUIRED", False, notes),
             classifier_threshold=threshold,
+            corrector_deployment=_text(environ, "CORRECTOR_DEPLOYMENT"),
+            corrector_endpoint=normalize_endpoint(_text(environ, "CORRECTOR_ENDPOINT")) if _text(environ, "CORRECTOR_ENDPOINT") else "",
+            corrector_api_key=_text(environ, "CORRECTOR_API_KEY"),
+            corrector_api=corrector_api,
+            corrector_reasoning_effort=effort,
+            corrector_max_output_tokens=_number(environ, "CORRECTOR_MAX_OUTPUT_TOKENS", 8000, int, 256, notes),
+            corrector_timeout=_number(environ, "CORRECTOR_TIMEOUT_SECONDS", 180.0, float, 1.0, notes),
             service_host=_text(environ, "SERVICE_HOST", "127.0.0.1"),
             service_port=service_port,
             service_api_keys=_text(environ, "SERVICE_API_KEYS"),
@@ -286,6 +310,54 @@ class Settings:
             scan_max_total_bytes=_number(environ, "SCAN_MAX_TOTAL_BYTES", 1_000_000, int, 1, notes),
             warnings=tuple(notes),
         )
+
+    @property
+    def corrector_resolved_endpoint(self) -> str:
+        return self.corrector_endpoint or self.decision1_endpoint
+
+    @property
+    def corrector_resolved_key(self) -> str:
+        return self.corrector_api_key or self.decision1_api_key
+
+    def corrector_problems(self) -> list[str]:
+        """What stops the corrector (GPT-6 Astra) from being used. Empty means ready, not that the key is valid."""
+        found = []
+        if not self.corrector_deployment:
+            found.append("No deployment: set CORRECTOR_DEPLOYMENT to the exact Name of your Astra deployment (Foundry portal, Deployments, Name column; often gpt-6-astra)")
+        elif " " in self.corrector_deployment or self.corrector_deployment.lower().startswith("your"):
+            found.append(f"CORRECTOR_DEPLOYMENT={self.corrector_deployment!r} is not a deployment name: deployment names have no spaces (it is the Name column, not the model's display name)")
+        endpoint = self.corrector_resolved_endpoint
+        if not endpoint:
+            found.append("No endpoint: set FOUNDRY_ENDPOINT (shared with Decision-1) or CORRECTOR_ENDPOINT")
+        elif "YOUR-RESOURCE" in endpoint.upper():
+            found.append("The endpoint still has the placeholder YOUR-RESOURCE: put your real resource endpoint there")
+        elif not endpoint.lower().startswith(("https://", "http://127.0.0.1", "http://localhost")):
+            found.append(f"The endpoint should start with https:// (got {endpoint[:40]!r})")
+        key = self.corrector_resolved_key
+        if not key:
+            found.append("No API key: set FOUNDRY_API_KEY (shared with Decision-1) or CORRECTOR_API_KEY")
+        elif _looks_like_placeholder(key):
+            found.append("The API key looks like a placeholder, not a real key")
+        return found
+
+    def describe_corrector(self) -> str:
+        """The corrector settings, without any secret: only whether the key is set, where it comes from, and its length."""
+        key = self.corrector_resolved_key
+        source = "CORRECTOR_API_KEY" if self.corrector_api_key else "FOUNDRY_API_KEY (shared with Decision-1)"
+        lines = [
+            "Corrector (GPT-6 Astra)",
+            f"  deployment ..... {self.corrector_deployment or 'NOT SET'}",
+            f"  endpoint ....... {self.corrector_resolved_endpoint or 'NOT SET'}"
+            + (" (shared with Decision-1)" if not self.corrector_endpoint and self.corrector_resolved_endpoint else ""),
+            f"  API key ........ {f'from {source}: set, {len(key)} characters' if key else 'NOT SET'}",
+            f"  route .......... {self.corrector_api}   (openai_v1 or inference; tests.live_corrector finds the one that works)",
+            f"  reasoning ...... effort {self.corrector_reasoning_effort}, at most {self.corrector_max_output_tokens} output tokens (thinking counts), "
+            f"{self.corrector_timeout:g} s timeout",
+        ]
+        found = self.corrector_problems()
+        lines.append("  problems ....... " + ("none" if not found else ""))
+        lines += [f"    - {p}" for p in found]
+        return "\n".join(lines)
 
     def service_problems(self) -> list[str]:
         """What stops the HTTP service from starting. Problems never contain key text."""
@@ -494,6 +566,22 @@ def demo() -> None:
     assert any("not the 0.70" in w for w in odd.warnings)
     assert Settings.from_env({**base, "CLASSIFIER_THRESHOLD": "1.5"}).classifier_threshold == 0.70
     assert Settings.from_env({**base, "CLASSIFIER_THRESHOLD": "soon"}).classifier_threshold == 0.70
+
+    # --- the corrector settings: Astra shares Decision-1's endpoint and key unless told otherwise
+    shared = {"FOUNDRY_ENDPOINT": "https://res.services.ai.azure.com/providers/microsoft/v1/systemone", "FOUNDRY_API_KEY": "kkkk-real-looking-key"}
+    c = Settings.from_env({**shared, "CORRECTOR_DEPLOYMENT": "gpt-6-astra"})
+    assert c.corrector_problems() == [] and c.corrector_resolved_endpoint == "https://res.services.ai.azure.com" and c.corrector_resolved_key == "kkkk-real-looking-key"
+    assert (c.corrector_api, c.corrector_reasoning_effort, c.corrector_max_output_tokens, c.corrector_timeout) == ("openai_v1", "low", 8000, 180.0)
+    assert "shared with Decision-1" in c.describe_corrector() and "kkkk-real-looking-key" not in c.describe_corrector() and "problems ....... none" in c.describe_corrector()
+    own = Settings.from_env({**shared, "CORRECTOR_DEPLOYMENT": "astra", "CORRECTOR_ENDPOINT": "https://other.services.ai.azure.com/", "CORRECTOR_API_KEY": "another-real-key-1"})
+    assert own.corrector_resolved_endpoint == "https://other.services.ai.azure.com" and own.corrector_resolved_key == "another-real-key-1" and "another-real-key-1" not in own.describe_corrector()
+    assert any("No deployment" in p for p in Settings.from_env(shared).corrector_problems())
+    assert any("no spaces" in p for p in Settings.from_env({**shared, "CORRECTOR_DEPLOYMENT": "GPT-6 Astra"}).corrector_problems())   # the display name is not a deployment name
+    assert any("No endpoint" in p for p in Settings.from_env({"CORRECTOR_DEPLOYMENT": "x", "FOUNDRY_API_KEY": "k" * 20}).corrector_problems())
+    assert any("No API key" in p for p in Settings.from_env({"CORRECTOR_DEPLOYMENT": "x", "FOUNDRY_ENDPOINT": shared["FOUNDRY_ENDPOINT"]}).corrector_problems())
+    odd_c = Settings.from_env({**shared, "CORRECTOR_DEPLOYMENT": "x", "CORRECTOR_API": "soap", "CORRECTOR_REASONING_EFFORT": "none", "CORRECTOR_MAX_OUTPUT_TOKENS": "5"})
+    assert (odd_c.corrector_api, odd_c.corrector_reasoning_effort, odd_c.corrector_max_output_tokens) == ("openai_v1", "low", 8000) and len(odd_c.warnings) >= 3
+    assert Settings.from_env({**shared, "CORRECTOR_DEPLOYMENT": "x", "CORRECTOR_REASONING_EFFORT": "XHIGH", "CORRECTOR_API": "Inference"}).corrector_reasoning_effort == "xhigh"
 
     # --- the service settings: safe defaults, validated, and the keys never printed
     service_key = "Kq3vZ8nR2mXw5tYb7LcD9fGh1JpS4aUe"

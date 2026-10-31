@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -69,11 +70,65 @@ class FakeDecision1(ThreadingHTTPServer):
         super().__init__(("127.0.0.1", 0), Handler)
         self.requests: list[dict] = []
         self.flaky_left = 0
+        self.chat_routes = {"openai_v1", "inference"}      # the chat routes this fake "resource" answers; the others give 404
+
+
+CHAT_PATHS = {"/openai/v1/chat/completions": "openai_v1", "/models/chat/completions": "inference"}
+
+
+def astra_reply(body: dict, deployment: str) -> dict:
+    """What a GPT-6 Astra deployment would answer for the built-in `ping` sample. Some deployment names misbehave on purpose."""
+    user = next(m["content"] for m in body["messages"] if m["role"] == "user")
+    ids = re.findall(r'<finding_[0-9a-f]+ id="(f\d+)"', user)
+    shown = re.search(r'<file_[0-9a-f]+ path="[^"]*">\n(.*)\n</file_[0-9a-f]+>', user, re.S)
+    if not shown or '\n    os.system("ping " + host)\n' not in "\n" + shown.group(1) + "\n":
+        # what the real GPT-6 Astra answered when the file arrived as a tuple's text instead of source lines
+        return {"model": "gpt-6-astra-2026-09-03", "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps(
+            {"edits": [], "unfixed": [{"finding_id": (ids or ["f1"])[0], "reason": "The supplied file is not Python source lines; provide the actual contents."}]})}}],
+            "usage": {"prompt_tokens": 510, "completion_tokens": 223, "completion_tokens_details": {"reasoning_tokens": 162}}}
+    usage = {"prompt_tokens": 480, "completion_tokens": 2100, "completion_tokens_details": {"reasoning_tokens": 1900}}
+    edits = {"edits": [
+        {"finding_ids": ids[:1], "old": '    os.system("ping " + host)\n', "new": '    subprocess.run(["ping", host], check=True)\n', "explanation": "Run ping without a shell."},
+        {"finding_ids": ids[:1], "old": "import os\n", "new": "import os\nimport subprocess\n", "explanation": "subprocess is needed."}]}
+    content, finish = json.dumps(edits), "stop"
+    if deployment == "truncated":
+        content, finish = "", "length"
+    elif deployment == "notjson":
+        content = "Sure, I fixed it for you!"
+    elif deployment == "badedit":
+        edits["edits"][0]["old"] = '    os.system("ping " + target)\n'
+        content = json.dumps(edits)
+    elif deployment == "swapped":                      # the fix removes the original problem but introduces a different one
+        edits["edits"][0]["new"] = '    eval("ping " + host)\n'
+        content = json.dumps(edits)
+    elif deployment == "unsafe":                       # the fix itself adds a new problem: the re-scan must notice
+        edits["edits"][0]["new"] = '    subprocess.run("ping " + host, shell=True)\n'
+        content = json.dumps(edits)
+    return {"model": "gpt-6-astra-2026-09-03", "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": finish}], "usage": usage}
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):          # keep the test output clean
         pass
+
+    def _chat(self, server, headers, body, route):
+        """A fake GPT-6 Astra: strict about parameters the way the real model is."""
+        if route not in server.chat_routes:
+            return self._send(404, {"error": {"code": "NotFound"}})
+        if headers.get("api-key") != GOOD_KEY:
+            return self._send(401, {"error": {"code": "Unauthorized"}})
+        if route == "inference" and headers.get("extra-parameters") != "pass-through":
+            return self._send(400, {"error": {"code": "unknown_parameter", "param": "max_completion_tokens"}})
+        for refused in ("temperature", "top_p", "logprobs", "max_tokens", "tools"):
+            if refused in body:
+                return self._send(400, {"error": {"code": "unsupported_parameter", "param": refused}})
+        if not isinstance(body.get("max_completion_tokens"), int):
+            return self._send(400, {"error": {"code": "missing_parameter", "param": "max_completion_tokens"}})
+        if body.get("reasoning_effort") not in ("low", "medium", "high", "xhigh"):
+            return self._send(400, {"error": {"code": "unsupported_value", "param": "reasoning_effort"}})
+        if body.get("model") == "missing":
+            return self._send(404, {"error": {"code": "DeploymentNotFound"}})
+        return self._send(200, astra_reply(body, body["model"]))
 
     def _send(self, status: int, payload: dict, extra: dict | None = None) -> None:
         data = json.dumps(payload).encode()
@@ -91,6 +146,8 @@ class Handler(BaseHTTPRequestHandler):
         headers = {k.lower(): v for k, v in self.headers.items()}
         body = json.loads(raw) if raw else {}
         server.requests.append({"path": self.path, "headers": headers, "body": body})
+        if self.path.split("?")[0] in CHAT_PATHS:
+            return self._chat(server, headers, body, CHAT_PATHS[self.path.split("?")[0]])
         if self.path != PATH:
             return self._send(404, {"error": {"code": "NotFound"}})
         if headers.get("api-key") != GOOD_KEY and headers.get("authorization") != f"Bearer {GOOD_TOKEN}":
@@ -251,6 +308,61 @@ def run() -> None:
                 assert list(down.coverage.analyzers_failed) == ["microsoft-decision-1@snippet.py"] and "wrong-key-99999" not in json.dumps(down.to_dict())
                 assert scan_with({**broken, "CLASSIFIER_REQUIRED": "true"}).decision == Decision.SCAN_FAILED
 
+            # 9c. the corrector's first-contact tool against a fake GPT-6 Astra: both routes, and every way a deployment can misbehave
+            from tests import live_corrector
+
+            def contact(*flags, **env):
+                lines: list[str] = []
+                base_env = {"FOUNDRY_ENDPOINT": full_url, "FOUNDRY_API_KEY": GOOD_KEY, "CORRECTOR_DEPLOYMENT": "gpt-6-astra"}
+                code = live_corrector.main(list(flags), environ={**base_env, **env}, out=lines.append)
+                return code, "\n".join(lines)
+
+            before = len(server.requests)
+            code, text = contact()
+            assert code == 0 and "RESULT on route openai_v1: the fix is usable end to end" in text, text
+            assert "CHECK parses: yes" in text and "problem types before ['command_injection'], still present at medium or above: none" in text
+            assert '+    subprocess.run(["ping", host], check=True)' in text and "tokens: 480 in, 2100 out (1900 of those were thinking); cost about $0.1098" in text
+            assert "answered by gpt-6-astra-2026-09-03" in text and "Put  CORRECTOR_API=openai_v1  in .env." in text and GOOD_KEY not in text
+            request = server.requests[before]
+            assert request["path"] == "/openai/v1/chat/completions" and request["headers"]["api-key"] == GOOD_KEY
+            assert set(request["body"]) == {"model", "messages", "max_completion_tokens", "reasoning_effort"} and request["body"]["reasoning_effort"] == "low"
+            assert len(server.requests) == before + 1                                                  # one request, no hidden extras
+
+            server.chat_routes = {"openai_v1"}                                                         # only one route exists on this "resource"
+            code, text = contact("--both")
+            assert code == 0 and "route inference" in text and "HTTP 404" in text and "the other CORRECTOR_API route" in text
+            assert "openai_v1 worked. Put  CORRECTOR_API=openai_v1  in .env." in text
+            server.chat_routes = {"inference"}
+            code, text = contact()                                                                     # the default route does not exist here: said plainly, exit 1
+            assert code == 1 and "HTTP 404" in text and "no route worked" in text
+            code, text = contact("--both")
+            assert code == 0 and "CORRECTOR_API=inference" in text and "different from your current setting" in text
+            assert server.requests[-1]["headers"]["extra-parameters"] == "pass-through"
+            server.chat_routes = {"openai_v1", "inference"}
+
+            for deployment, expected in (("truncated", "whole output budget thinking"), ("notjson", "not a JSON object"), ("badedit", "do not fit the file"),
+                                         ("unsafe", "NOT usable"), ("swapped", "new at medium or above: ['code_injection']"), ("missing", "CORRECTOR_DEPLOYMENT")):
+                code, text = contact("--show-raw", CORRECTOR_DEPLOYMENT=deployment)
+                assert code == 1 and expected in text and GOOD_KEY not in text, (deployment, text)
+            code, text = contact(CORRECTOR_DEPLOYMENT="notjson")
+            assert "what the model said" in text and "Sure, I fixed it for you!" in text                  # when the answer is unusable, it is shown (the sample only)
+            code, text = contact("--show-raw")
+            assert "raw reply:" in text and '"edits"' in text
+            code, text = contact(FOUNDRY_API_KEY="the-wrong-key-12345")
+            assert code == 1 and "authentication failed" in text and "the-wrong-key-12345" not in text
+
+            # settings problems stop it before any request is made
+            before = len(server.requests)
+            for env, expected in (({"CORRECTOR_DEPLOYMENT": ""}, "No deployment"), ({"CORRECTOR_DEPLOYMENT": "GPT-6 Astra"}, "no spaces"), ({"FOUNDRY_API_KEY": ""}, "No API key")):
+                code, text = contact(**env)
+                assert code == 2 and expected in text and "not ready" in text, (env, text)
+            code, text = contact("--sample", "upload")                                                 # the rules cannot see this one, so there is no finding to fix
+            assert code == 2 and "nothing to ask the model to fix" in text
+            code, text = contact("--sample", "nonsense")
+            assert code == 2 and "Unknown sample" in text and len(server.requests) == before
+            code, text = contact(CORRECTOR_REASONING_EFFORT="none")                                    # a value Astra refuses is replaced, with a warning
+            assert code == 0 and "warning: CORRECTOR_REASONING_EFFORT='none'" in text and server.requests[-1]["body"]["reasoning_effort"] == "low"
+
             # 10. the program itself: `python -m tests.live_decision1` configured only by a .env file
             clean = {k: v for k, v in os.environ.items() if k not in VARIABLES}
             done = subprocess.run([sys.executable, "-m", "tests.live_decision1"], cwd=REPO_ROOT, capture_output=True, text=True,
@@ -310,6 +422,13 @@ def run() -> None:
             rules_only = subprocess.run([sys.executable, "-m", "security_service.scan", str(target)], cwd=REPO_ROOT, capture_output=True, text=True,
                                         encoding="utf-8", env={**clean, "SECURITY_ENV_FILE": str(env_path)}, timeout=60)
             assert rules_only.returncode == 0 and "decision: pass" in rules_only.stdout and "microsoft-decision-1" not in rules_only.stdout   # off by default
+
+            # 10c. the corrector tool as a program, from a .env file
+            corrector_env = Path(folder) / "corrector.env"
+            corrector_env.write_text(f"FOUNDRY_ENDPOINT={full_url}\nFOUNDRY_API_KEY={GOOD_KEY}\nCORRECTOR_DEPLOYMENT=gpt-6-astra\n", encoding="utf-8")
+            as_program = subprocess.run([sys.executable, "-m", "tests.live_corrector"], cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8",
+                                        env={**clean, "SECURITY_ENV_FILE": str(corrector_env)}, timeout=120)
+            assert as_program.returncode == 0 and "the fix is usable end to end" in as_program.stdout and GOOD_KEY not in as_program.stdout + as_program.stderr, as_program.stdout + as_program.stderr
 
             # ...a variable in the terminal beats the file: a wrong key in the terminal must fail, even though the file has the right one
             override = subprocess.run([sys.executable, "-m", "tests.live_decision1"], cwd=REPO_ROOT, capture_output=True, text=True,

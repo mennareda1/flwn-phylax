@@ -18,6 +18,27 @@ from security_service.core.files import SourceFile
 from security_service.core.schema import Finding
 
 
+class CorrectorError(RuntimeError):
+    """Base class for every corrector failure. Never carries the submitted code or a credential in its message."""
+
+
+class CorrectorUnavailable(CorrectorError):
+    """Trouble that outlasted the adapter's retries (timeouts, rate limits, 5xx)."""
+
+
+class CorrectorRejected(CorrectorError):
+    """The provider refused the request (bad key, wrong deployment, unsupported parameter); retrying will not help."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+class BadProposal(CorrectorError):
+    """The model answered, but the answer cannot be used: not JSON, an edit that does not match the file, a forbidden change.
+    The fix is NOT applied and no half-answer is returned."""
+
+
 @dataclass(frozen=True)
 class FixConstraints:
     max_patch_lines: int = 40          # added plus removed lines, per patch
@@ -50,6 +71,8 @@ class Corrector(Protocol):
 
 
 def demo() -> None:
+    assert issubclass(CorrectorUnavailable, CorrectorError) and issubclass(CorrectorRejected, CorrectorError) and issubclass(BadProposal, CorrectorError)
+    assert CorrectorRejected("no", status=404).status == 404 and CorrectorRejected("no").status is None
     patch = Patch("a.py", ("f1",), "--- a/a.py\n+++ b/a.py\n", "why")
     assert patch.to_dict() == {"path": "a.py", "finding_ids": ["f1"], "unified_diff": "--- a/a.py\n+++ b/a.py\n", "explanation": "why"}
     assert FixConstraints().max_patch_lines == 40
