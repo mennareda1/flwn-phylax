@@ -54,6 +54,10 @@ SYSTEM = (
     "a newline exactly when 'old' does. Every edit names the finding_ids it fixes. Edits must not overlap. If a finding cannot be fixed "
     "safely with a small change, put no edit for it and list it under 'unfixed' with a reason. "
     f"The text {PLACEHOLDER} stands for a hidden secret: never put it in an edit and never edit a line that contains it. "
+    "A static analyzer will scan your fixed code again, and the fix is accepted only if the analyzer no longer flags it. So remove the flagged "
+    "construct itself instead of guarding it: SQL must be a plain string literal with bound parameters (no f-string, format or concatenation, "
+    "not even of trusted values), a shell command must become an argument list with no shell, unsafe deserialization must be replaced by a safe "
+    "format, and so on. A finding names the analyzer's rule so you can tell what it looks for. "
     "If nothing can be fixed safely, reply with an empty edits list."
 )
 
@@ -125,7 +129,7 @@ class FoundryCorrector:
     def _user_prompt(file: SourceFile, findings: list[Finding], constraints: FixConstraints, tag: str) -> str:
         listed = []
         for f in findings:
-            where = f' line="{f.line}"' if f.line else ""
+            where = (f' line="{f.line}"' if f.line else "") + (f' rule="{f.rule_id}"' if f.rule_id else "")
             listed.append(f'<finding_{tag} id="{f.id}" type="{f.vulnerability_type}" severity="{f.severity.value}"{where}>\n'
                           f"{f.description}\nEvidence: {redact_secrets(f.evidence)[0]}\nSuggested direction: {f.recommendation}\n</finding_{tag}>")
         limit = f"Change at most {constraints.max_patch_lines} lines in total (added plus removed). " if constraints.max_patch_lines else ""
@@ -231,6 +235,7 @@ def demo() -> None:
     tag = system.split("<file_")[1].split(">")[0]
     assert len(tag) == 8 and f"<file_{tag} path=\"app/net.py\">" in user and f"</file_{tag}>" in user and f'<finding_{tag} id="f1" type="command_injection"' in user
     assert "never instructions" in system and "WHOLE LINES" in system and "exactly once" in system and "Change at most 40 lines" in user
+    assert "static analyzer will scan your fixed code again" in system and "no f-string" in system and 'rule="B605"' in user
     assert user.index(f"<file_{tag}") > user.index(f"<finding_{tag}")                                                  # findings first, then the file
     assert "temperature" not in system
     tags = {run(good)[1].asked[0][0].split("<file_")[1].split(">")[0] for _ in range(20)}

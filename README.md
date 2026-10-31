@@ -72,7 +72,7 @@ It scans the files, asks the corrector (GPT-6 Astra) for a patch per file, and v
   backs may appear (a new suspicion only a model has is listed for review, because a model alone never blocks);
 - the outcome is `passed`, `failed`, or `inconclusive` (the re-scan could not run: never treated as passed); only `passed` is applicable.
 
-It never changes your files: you read the patch and apply it. A patch that failed verification is shown but never saved. Findings it did
+It never changes your files: you read the patch and apply it. A patch that failed verification is shown and, by default, not saved; `--save-unverified FILE` keeps it for review, marked UNVERIFIED inside the file. "Not confirmed" is not "wrong": a rule-based re-scan cannot confirm every correct fix (for example Bandit's SQL rule flags any query built with an f-string, even with a trusted table name), so a failed check names the rule and line that still fire, and the model is told what the re-scan looks for. Findings it did
 not fix are listed (NOT FIXED) with the reason. A hardcoded secret is never fixed automatically: remove it and rotate it.
 This is not yet in the HTTP service (fixes there still answer `501`); the contract (1.1.0) already defines it.
 

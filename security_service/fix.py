@@ -6,6 +6,7 @@ Ask for verified fixes for your own files, from the command line, and read them 
     python -m security_service.fix app.py
     python -m security_service.fix src\\a.py src\\b.py --save-patch fix.diff
     python -m security_service.fix app.py --finding f1,f3        only these findings, by the ids a scan printed
+    python -m security_service.fix app.py --save-unverified fix.diff   also keep a patch that was NOT confirmed, marked UNVERIFIED inside the file
     python -m security_service.fix app.py --json                 the full machine-readable result
 
 It scans the files with the engines your settings switch on, asks the corrector (GPT-6 Astra) for a patch per file, then VERIFIES
@@ -14,7 +15,10 @@ must show the fixed findings gone and nothing new backed by a rule. It prints th
 
 IT NEVER CHANGES YOUR FILES. With --save-patch it writes the verified patch to a file, and you apply it yourself after reading it:
     git apply fix.diff          (from the folder the paths are relative to)
-A patch that failed verification is shown but never saved. Hardcoded secrets are not fixed automatically (rotate them).
+A patch that failed verification is shown, and is saved only if you ask with --save-unverified, in which case the file begins with a
+plain-text UNVERIFIED notice (git ignores it). "Not confirmed" is not "wrong": a rule-based re-scan cannot confirm every correct fix (Bandit
+flags SQL built with an f-string even when the only trusted value is a table name), so read the patch and test the code. Hardcoded secrets
+are not fixed automatically (rotate them).
 Needs the corrector settings (CORRECTOR_DEPLOYMENT in .env); a request costs a few cents. Run `python -m tests.live_corrector` first.
 
 Exit code: 0 a verified fix was produced, 1 nothing at medium severity or above to fix, 3 no verified fix (see why),
@@ -43,7 +47,7 @@ def _value(argv: list[str], flag: str) -> str | None:
 
 
 def main(argv: list[str], environ=None, out=print, corrector=None, scan_service=None) -> int:
-    flags_with_values = {"--finding", "--max-lines", "--save-patch"}
+    flags_with_values = {"--finding", "--max-lines", "--save-patch", "--save-unverified"}
     paths = [a for i, a in enumerate(argv) if not a.startswith("--") and not (i > 0 and argv[i - 1] in flags_with_values)]
     if not paths:
         out("Usage: python -m security_service.fix FILE [FILE ...] [--finding f1,f2] [--max-lines N] [--save-patch FILE] [--json]")
@@ -124,13 +128,26 @@ def main(argv: list[str], environ=None, out=print, corrector=None, scan_service=
         if usage and usage.get("calls"):
             out(f"model use: {usage['calls']} request(s), {usage['prompt_tokens']} tokens in, {usage['completion_tokens']} out ({usage['reasoning_tokens']} thinking)")
 
-    saved = _value(argv, "--save-patch")
+    saved, unverified = _value(argv, "--save-patch"), _value(argv, "--save-unverified")
+    diff_text = "".join(p.unified_diff for p in result.patches)
     if result.applicable and saved:
-        Path(saved).write_text("".join(p.unified_diff for p in result.patches), encoding="utf-8", newline="\n")
+        Path(saved).write_text(diff_text, encoding="utf-8", newline="\n")
         if not as_json:
             out(f"\nSaved the verified patch to {saved}. Read it, then apply it yourself:  git apply {saved}")
     elif saved and not as_json:
-        out(f"\nNot saved: a patch is saved only when it passed verification.")
+        out("\nNot saved: a patch is saved only when it passed verification. To keep it for review anyway, use --save-unverified FILE (it is marked UNVERIFIED inside the file).")
+    if unverified:
+        if not result.patches:
+            if not as_json:
+                out("\nNothing to save: no patch was produced.")
+        else:
+            notice = "" if result.applicable else (
+                f"# UNVERIFIED PATCH: Phylax could not confirm this fix. {result.failure_reason}\n"
+                "# That means NOT CONFIRMED, not necessarily wrong. Read the patch and test the code before applying it.\n"
+                "# This is a plain unified diff: git ignores these comment lines.\n\n")
+            Path(unverified).write_text(notice + diff_text, encoding="utf-8", newline="\n")
+            if not as_json:
+                out(f"\nSaved the patch to {unverified}" + ("." if result.applicable else f", marked UNVERIFIED. It was NOT confirmed: read it carefully and test the code before:  git apply {unverified}"))
     if as_json:
         return 0 if result.applicable else 3
     if result.applicable:
@@ -138,6 +155,8 @@ def main(argv: list[str], environ=None, out=print, corrector=None, scan_service=
             "\nRESULT: a verified fix was produced for the findings it covers (see NOT FIXED above for the rest). Nothing was changed: you apply it after reading it.")
         return 0
     out(f"\nRESULT: no verified fix. {result.failure_reason}")
+    if result.patches:
+        out("A failed verification means the patch is NOT CONFIRMED, not that it is wrong: a rule-based re-scan cannot confirm every correct fix. Read the patch above.")
     return 3
 
 
@@ -199,6 +218,25 @@ def demo() -> None:
         assert main([str(net), "--save-patch", str(unsaved)], environ=ready, out=say, corrector=Careless()) == 3
         text = "\n".join(shown)
         assert "VERIFICATION: failed" in text and "new finding n1: code_injection" in text and "RESULT: no verified fix" in text and "Not saved" in text and not unsaved.exists()
+        assert "--save-unverified" in text and "NOT CONFIRMED, not that it is wrong" in text
+        shown.clear()
+
+        # --save-unverified keeps the patch for review, marked inside the file; it is still not a pass, and the user's file is untouched
+        kept = Path(folder) / "kept.diff"
+        assert main([str(net), "--save-unverified", str(kept)], environ=ready, out=say, corrector=Careless()) == 3
+        body = kept.read_text(encoding="utf-8")
+        assert body.startswith("# UNVERIFIED PATCH: Phylax could not confirm this fix.") and "NOT CONFIRMED, not necessarily wrong" in body and "git ignores" in body
+        assert "marked UNVERIFIED" in "\n".join(shown) and net.read_bytes() == before
+        raw_diff = body[body.index("--- a/"):]
+        assert 'eval("ping " + host)' in raw_diff and apply_unified_diff(bad, raw_diff, net.as_posix()).count("eval(") == 1       # the diff after the notice is a normal, strict diff
+        shown.clear()
+        verified_copy = Path(folder) / "verified_copy.diff"                                         # a verified patch saved this way has NO unverified notice
+        assert main([str(net), "--save-unverified", str(verified_copy)], environ=ready, out=say, corrector=Corrector()) == 0
+        assert verified_copy.read_text(encoding="utf-8").startswith("--- a/")
+        shown.clear()
+        nothing_to_keep = Path(folder) / "nothing.diff"
+        assert main([str(net), "--save-unverified", str(nothing_to_keep)], environ=ready, out=say, corrector=FakeCorrector("zzz", "yyy")) == 3
+        assert "Nothing to save: no patch was produced." in "\n".join(shown) and not nothing_to_keep.exists()
         shown.clear()
 
         # a clean file, a missing corrector setting, an unreadable file, bad arguments: each said plainly, none a stack trace

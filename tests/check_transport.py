@@ -398,6 +398,10 @@ def run() -> None:
                 code, text = repair("--save-patch", str(refused_patch), CORRECTOR_DEPLOYMENT=deployment)
                 assert code == 3 and expected in text and "RESULT: no verified fix" in text, (deployment, text)
                 assert not refused_patch.exists() and sample_file.read_text(encoding="utf-8") == original_text, deployment      # nothing saved, nothing changed
+            kept_patch = Path(folder) / "kept_unsafe.diff"
+            code, text = repair("--save-unverified", str(kept_patch), CORRECTOR_DEPLOYMENT="swapped")
+            assert code == 3 and "marked UNVERIFIED" in text and kept_patch.read_text(encoding="utf-8").startswith("# UNVERIFIED PATCH") and 'eval("ping " + host)' in kept_patch.read_text(encoding="utf-8")
+            assert sample_file.read_text(encoding="utf-8") == original_text
             code, text = repair(FOUNDRY_API_KEY="the-wrong-key-12345")
             assert code == 3 and "authentication failed" in text and "the-wrong-key-12345" not in text
             assert repair("--finding", "f9")[0] == 4 and repair(CORRECTOR_DEPLOYMENT="")[0] == 4              # a bad id, and a missing setting, never reach the model

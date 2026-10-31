@@ -202,7 +202,14 @@ class VerificationService:
                 new_findings = [replace(f, id=f"n{i}") for i, f in enumerate(new_findings, start=1)]
                 model_only = len(new_findings) - rule_backed_new
                 if unresolved:
-                    listed = "; ".join(f"{f.id} ({f.vulnerability_type} in {f.path})" for f in unresolved[:4])
+                    def remains(f: Finding) -> str:
+                        same = sorted(count_after.get(_key(f), []), key=lambda g: g.line or 0)
+                        if not same:
+                            return ""
+                        g = same[0]
+                        return f"; still flagged at line {g.line} by {g.rule_id}" if g.line and g.rule_id else f"; still suspected by {g.sources[0] if g.sources else 'a model'}"
+
+                    listed = "; ".join(f"{f.id} ({f.vulnerability_type} in {f.path}{remains(f)})" for f in unresolved[:4])
                     checks.append(Check("rescan", "fail", f"Still present after the change: {listed}."))
                 elif rule_backed_new:
                     checks.append(Check("rescan", "fail", f"{rule_backed_new} new finding(s) at medium severity or above appeared, backed by a rule."))
@@ -296,7 +303,7 @@ def demo() -> None:
     failed(verify([SourceFile("other.py", good)]), "scope", "not in the original scan")                            # a file the scan never had
     failed(verify([SourceFile("net.py", good.replace("check=True)", "check=True"))]), "syntax", "does not parse")  # broken syntax
     failed(verify([SourceFile("net.py", good.replace("import os\n", ""))]), "syntax", "names nothing defines after the change: os")  # removed an import still in use
-    failed(verify([SourceFile("net.py", original.replace("return True", "return True  # still unsafe"))]), "rescan", "f1 (command_injection in net.py)")   # the problem is still there
+    failed(verify([SourceFile("net.py", original.replace("return True", "return True  # still unsafe"))]), "rescan", "f1 (command_injection in net.py; still flagged at line 4 by B605)")   # the problem is still there
     swapped = verify([SourceFile("net.py", good.replace('subprocess.run(["ping", host], check=True)', 'eval("ping " + host)'))])
     failed(swapped, "rescan", "1 new finding(s)")
     assert swapped.resolved_finding_ids == ("f1",) and [(f.id, f.vulnerability_type) for f in swapped.new_findings] == [("n1", "code_injection")]      # f1 gone, but a new problem came in
@@ -330,7 +337,7 @@ def demo() -> None:
     assert noisy.outcome == "passed" and [f.vulnerability_type for f in noisy.new_findings] == ["path_traversal"] and "listed for review" in noisy.checks[-1].detail
     path_flag = ScanService([Model()]).scan([SourceFile("up.py", "def r(n):\n    return open(n).read()\n")]).findings
     still = VerificationService(ScanService([Model()])).verify([SourceFile("up.py", "def r(n):\n    return open(n).read()\n")], [SourceFile("up.py", "def r(n):\n    return open(n).read()  # checked\n")], path_flag)
-    failed(still, "rescan", "path_traversal in up.py")                                                           # the model still suspects it: not confirmed
+    failed(still, "rescan", "path_traversal in up.py; still suspected by model)")                                                           # the model still suspects it: not confirmed
     cured = VerificationService(ScanService([Model()])).verify([SourceFile("up.py", "def r(n):\n    return open(n).read()\n")], [SourceFile("up.py", "def r(n):\n    return n\n")], path_flag)
     assert cured.outcome == "passed" and cured.resolved_finding_ids == ("f1",)
 
@@ -342,7 +349,7 @@ def demo() -> None:
     only_first = verifier.verify([SourceFile("m.py", two)], [SourceFile("m.py", one_fixed)], base5, requested_ids=["f1"])
     assert only_first.outcome == "passed" and only_first.resolved_finding_ids == ("f1",)                          # f2 was not asked about, and is still there
     both = verifier.verify([SourceFile("m.py", two)], [SourceFile("m.py", one_fixed)], base5)                      # by default every medium-or-above finding in changed files
-    failed(both, "rescan", "f2 (command_injection in m.py)")
+    failed(both, "rescan", "f2 (command_injection in m.py; still flagged at line 7 by B605)")
     try:
         verifier.verify([SourceFile("m.py", two)], [SourceFile("m.py", one_fixed)], base5, requested_ids=["f9"])
         raise AssertionError("an unknown id must be refused")
