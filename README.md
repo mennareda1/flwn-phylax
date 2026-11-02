@@ -45,6 +45,8 @@ screenshot it. `.env.example` is the committed template and contains placeholder
 | `SERVICE_HOST`, `SERVICE_PORT` | no | `127.0.0.1`, `8080` | Where it listens. `127.0.0.1` means this computer only. |
 | `SERVICE_RETENTION_HOURS` | no | `24` | How long submitted code and results are kept (in memory only). |
 | `SERVICE_WORKERS`, `SERVICE_RATE_LIMIT_PER_MINUTE`, `SERVICE_MAX_WAIT_SECONDS` | no | `4`, `120`, `30` | Scans at once, requests per minute per caller, longest `Prefer: wait`. |
+| `SERVICE_FIXES_ENABLED` | no | `false` | Turns on fixes in the service (needs the `CORRECTOR_*` settings; the service refuses to start without them). |
+| `SERVICE_FIX_WORKERS`, `SERVICE_FIX_RATE_LIMIT_PER_MINUTE` | no | `2`, `10` | Fixes run in their own small pool, with a stricter per-caller limit, so they cannot starve scans or run up the bill. |
 | `SCAN_MAX_FILES`, `SCAN_MAX_FILE_BYTES`, `SCAN_MAX_TOTAL_BYTES` | no | `50`, `200000`, `1000000` | Request limits. |
 | `SECURITY_ENV_FILE` | no | | Path of a `.env` file to use instead of the default lookup. |
 
@@ -79,13 +81,12 @@ Give it files or a whole folder (`python -m security_service.fix src --save-patc
 
 It never changes your files: you read the patch and apply it. A patch that failed verification is shown and, by default, not saved; `--save-unverified FILE` keeps it for review, marked UNVERIFIED inside the file. "Not confirmed" is not "wrong": a rule-based re-scan cannot confirm every correct fix (for example Bandit's SQL rule flags any query built with an f-string, even with a trusted table name), so a failed check names the rule and line that still fire, and the model is told what the re-scan looks for. Findings it did
 not fix are listed (NOT FIXED) with the reason. A hardcoded secret is never fixed automatically: remove it and rotate it.
-This is not yet in the HTTP service (fixes there still answer `501`); the contract (1.1.0) already defines it.
+The same service is available through the HTTP service (below) when `SERVICE_FIXES_ENABLED=true`.
 
 ## The corrector (GPT-6 Astra)
 
-The corrector turns a finding into a proposed fix. It is built and tested, and has been run only against a test double until you
-run the first real call (below). It is not yet connected to the HTTP service: fixes still answer `501` until the fix service,
-which verifies every patch, is built.
+The corrector turns a finding into a proposed fix. It has run against the real GPT-6 Astra (the first call below), and is used by
+the fix tool and, when switched on, by the HTTP service, always behind the verification that decides whether a patch is applicable.
 
 First real call, with one line in `.env` (`CORRECTOR_DEPLOYMENT=<the Name of your Astra deployment>`; the endpoint and key are
 shared with Decision-1):
@@ -128,13 +129,21 @@ Waiting: `Prefer: wait=N` holds the request up to N seconds (never more than `SE
 with the finished scan; otherwise 202 with a `Location` to poll. Retrying with the same `Idempotency-Key` and the same
 body returns the original scan instead of starting another (and makes no second model call).
 
+Fixes and verifications (`POST /v1/scans/{id}/fixes`, `POST /v1/verifications`, and `GET` for each) work the same way as scans: the key is
+checked first, a retry with the same `Idempotency-Key` returns the same result with no second model call, and `Prefer: wait=N` waits or you poll.
+Both need a COMPLETED scan of the same caller (`409 scan_not_completed` otherwise; someone else's scan is "not found"). A fix needs the `fix`
+scope and fix mode on; it asks the corrector for a patch per file and then VERIFIES it itself, so `applicable` is true only when verification
+passed, and nothing is ever applied by the service. A verification needs the `scan` scope and checks a correction the caller wrote (up to 200
+changed lines). A scan may hold only 5 fix requests (`409 fix_limit_reached`: waiting will not help). Fixes and verifications live as long as
+their scan and are deleted with it.
+
 What it keeps, and what it does not: submitted code and results are held in MEMORY ONLY for `SERVICE_RETENTION_HOURS`,
 removed earlier by `DELETE /v1/scans/{id}`, and gone when the service stops. Nothing is written to disk. Logs hold one line
 per request (method, path, status, time, caller, request id): never a body, a key or a line of code.
 
 What it does not do yet, said plainly:
-- Fixes and verifications answer `501 not_implemented` (the corrector is the next step). `GET /v1/capabilities` has
-  `features` so a client can ask first.
+- Fixes are OFF unless `SERVICE_FIXES_ENABLED=true`, because every fix request is a paid model call; off, they answer
+  `501 not_implemented`. `GET /v1/capabilities` has `features` so a client can ask first.
 - It speaks plain HTTP. Put HTTPS in front of it (a reverse proxy or the platform's ingress) before it is reachable
   from anywhere but this computer; the default `SERVICE_HOST=127.0.0.1` is deliberately that safe.
 - One instance only: scans, keys-to-scans, idempotency and rate limits live in this process. Running several copies behind
@@ -250,9 +259,11 @@ Not yet run against a real model: the LLM detector and the Foundry adapter.
 
 Run against the real GPT-6 Astra: the corrector (`python -m tests.live_corrector`, both routes, a verified fix).
 
-Built and tested against a test double only: the fix service and the verification service (`python -m security_service.fix`), until you run them on your own files.
+Run on real code with the real Astra: the fix and verification services (`python -m security_service.fix`), on a deliberately vulnerable app, with every patch attacked before and after.
 
-Not built yet: the fix and verification endpoints in the HTTP service (they answer `501`), the fix-quality test, the Flwn side of the
+Built and tested end to end over real sockets, against a test double of Astra: the fix and verification endpoints of the HTTP service. Not yet run with the real Astra through the service.
+
+Not built yet: the measured fix-quality test (the pass/fail rule fixed first, then new cases), an optional behavior check that runs a project's own tests, the Flwn side of the
 integration, chunking of large files for the model, a persistent job store and a shared rate limiter for running several
 instances, TLS, and the C++, C# and JS lanes.
 

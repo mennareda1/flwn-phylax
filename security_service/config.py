@@ -49,7 +49,8 @@ VARIABLES = (
     "CORRECTOR_DEPLOYMENT", "CORRECTOR_ENDPOINT", "CORRECTOR_API_KEY", "CORRECTOR_API", "CORRECTOR_REASONING_EFFORT",
     "CORRECTOR_MAX_OUTPUT_TOKENS", "CORRECTOR_TIMEOUT_SECONDS",
     "SERVICE_HOST", "SERVICE_PORT", "SERVICE_API_KEYS", "SERVICE_RETENTION_HOURS", "SERVICE_WORKERS",
-    "SERVICE_RATE_LIMIT_PER_MINUTE", "SERVICE_MAX_WAIT_SECONDS",
+    "SERVICE_RATE_LIMIT_PER_MINUTE", "SERVICE_MAX_WAIT_SECONDS", "SERVICE_FIXES_ENABLED", "SERVICE_FIX_WORKERS",
+    "SERVICE_FIX_RATE_LIMIT_PER_MINUTE",
     "SCAN_MAX_FILES", "SCAN_MAX_FILE_BYTES", "SCAN_MAX_TOTAL_BYTES",
 )
 
@@ -235,6 +236,9 @@ class Settings:
     service_workers: int = 4
     service_rate_limit_per_minute: int = 120
     service_max_wait_seconds: int = 30
+    service_fixes_enabled: bool = False
+    service_fix_workers: int = 2
+    service_fix_rate_limit_per_minute: int = 10
     scan_max_files: int = 50
     scan_max_file_bytes: int = 200_000
     scan_max_total_bytes: int = 1_000_000
@@ -305,6 +309,9 @@ class Settings:
             service_workers=_number(environ, "SERVICE_WORKERS", 4, int, 1, notes),
             service_rate_limit_per_minute=_number(environ, "SERVICE_RATE_LIMIT_PER_MINUTE", 120, int, 1, notes),
             service_max_wait_seconds=min(_number(environ, "SERVICE_MAX_WAIT_SECONDS", 30, int, 1, notes), 120),
+            service_fixes_enabled=_flag(environ, "SERVICE_FIXES_ENABLED", False, notes),
+            service_fix_workers=_number(environ, "SERVICE_FIX_WORKERS", 2, int, 1, notes),
+            service_fix_rate_limit_per_minute=_number(environ, "SERVICE_FIX_RATE_LIMIT_PER_MINUTE", 10, int, 1, notes),
             scan_max_files=_number(environ, "SCAN_MAX_FILES", 50, int, 1, notes),
             scan_max_file_bytes=_number(environ, "SCAN_MAX_FILE_BYTES", 200_000, int, 1, notes),
             scan_max_total_bytes=_number(environ, "SCAN_MAX_TOTAL_BYTES", 1_000_000, int, 1, notes),
@@ -366,6 +373,8 @@ class Settings:
         _, problems = parse_api_keys(self.service_api_keys)
         if self.classifier_enabled:
             problems += [f"CLASSIFIER_ENABLED is on but {p[0].lower() + p[1:]}" for p in self.problems()]
+        if self.service_fixes_enabled:
+            problems += [f"SERVICE_FIXES_ENABLED is on but {p[0].lower() + p[1:]}" for p in self.corrector_problems()]
         return problems
 
     def describe_service(self) -> str:
@@ -381,6 +390,8 @@ class Settings:
             f"submitted code kept {self.service_retention_hours} hours, in memory only; {self.service_workers} scans at a time; "
             f"{self.service_rate_limit_per_minute} requests per minute per caller; waits up to {self.service_max_wait_seconds} s",
             "Decision-1 in scans: " + (f"ON at {self.classifier_threshold:.2f}" if self.classifier_enabled else "OFF (rules only)"),
+            ("Fixes: ON, by " + (self.corrector_deployment or "?") + f"; {self.service_fix_workers} at a time, {self.service_fix_rate_limit_per_minute} requests per minute per caller (each one costs a model call)")
+            if self.service_fixes_enabled else "Fixes: OFF (answered with 501 until SERVICE_FIXES_ENABLED=true)",
         ]
         lines += [f"WARNING: {w}" for w in self.warnings]
         found = self.service_problems()
@@ -599,6 +610,14 @@ def demo() -> None:
     assert (tuned_svc.service_port, tuned_svc.service_workers, tuned_svc.service_retention_hours, tuned_svc.service_rate_limit_per_minute) == (9000, 8, 48, 30)
     assert tuned_svc.service_max_wait_seconds == 120                                                  # capped
     assert Settings.from_env({**base, "SERVICE_PORT": "70000"}).service_port == 8080 and Settings.from_env({**base, "SERVICE_PORT": "x"}).service_port == 8080
+    # --- fixes in the service: off by default, and they refuse to start half-configured
+    assert svc.service_fixes_enabled is False and (svc.service_fix_workers, svc.service_fix_rate_limit_per_minute) == (2, 10) and "Fixes: OFF" in svc.describe_service()
+    fixes_on = Settings.from_env({**base, "SERVICE_API_KEYS": f"a:read:{service_key}", "SERVICE_FIXES_ENABLED": "true", "CORRECTOR_DEPLOYMENT": "gpt-6-astra",
+                                  "SERVICE_FIX_WORKERS": "3", "SERVICE_FIX_RATE_LIMIT_PER_MINUTE": "7", "FOUNDRY_ENDPOINT": "https://r.services.ai.azure.com", "FOUNDRY_API_KEY": "real-looking-key-1"})
+    assert fixes_on.service_problems() == [] and fixes_on.service_fix_workers == 3 and fixes_on.service_fix_rate_limit_per_minute == 7
+    assert "Fixes: ON, by gpt-6-astra; 3 at a time, 7 requests per minute" in fixes_on.describe_service()
+    half = Settings.from_env({"SERVICE_API_KEYS": f"a:read:{service_key}", "SERVICE_FIXES_ENABLED": "true"})
+    assert any("SERVICE_FIXES_ENABLED is on but" in p and "deployment" in p for p in half.service_problems())
     on_without_model = Settings.from_env({"CLASSIFIER_ENABLED": "true", "SERVICE_API_KEYS": f"a:read:{service_key}"})
     assert any("CLASSIFIER_ENABLED is on but" in p for p in on_without_model.service_problems())
 

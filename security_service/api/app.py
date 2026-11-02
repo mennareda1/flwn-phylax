@@ -151,29 +151,31 @@ def create_app(gateway: Gateway) -> FastAPI:
     @app.post("/v1/scans/{scan_id}/fixes")
     async def create_fix(scan_id: str, request: Request):
         async def work():
-            authed(request, "fix")
-            return gateway.not_available("Fixes")
+            principal = authed(request, "fix")
+            body = await read_limited(request, 65_536)
+            headers = {name.lower(): value for name, value in request.headers.items()}
+            return await run_in_threadpool(gateway.create_fix, principal, scan_id, headers, body)
         return await guarded(request, work)
 
     @app.get("/v1/fixes/{fix_id}")
     async def get_fix(fix_id: str, request: Request):
         async def work():
-            authed(request, "read")
-            return gateway.unknown("fix")
+            return gateway.get_fix(authed(request, "read"), fix_id)
         return await guarded(request, work)
 
     @app.post("/v1/verifications")
     async def create_verification(request: Request):
         async def work():
-            authed(request, "scan")
-            return gateway.not_available("Verifications")
+            principal = authed(request, "scan")
+            body = await read_limited(request, gateway.max_body_bytes)
+            headers = {name.lower(): value for name, value in request.headers.items()}
+            return await run_in_threadpool(gateway.create_verification, principal, headers, body)
         return await guarded(request, work)
 
     @app.get("/v1/verifications/{verification_id}")
     async def get_verification(verification_id: str, request: Request):
         async def work():
-            authed(request, "read")
-            return gateway.unknown("verification")
+            return gateway.get_verification(authed(request, "read"), verification_id)
         return await guarded(request, work)
 
     @app.get("/v1/capabilities")
@@ -211,14 +213,22 @@ def create_app(gateway: Gateway) -> FastAPI:
     return app
 
 
-def build_app(settings, classifier=None) -> FastAPI:
-    """The service as configured by environment settings. Raises ValueError, with a plain message, if it cannot start."""
+def build_app(settings, classifier=None, corrector=None) -> FastAPI:
+    """The service as configured by environment settings. Raises ValueError, with a plain message, if it cannot start.
+    Fixes are built only when SERVICE_FIXES_ENABLED is on (and the corrector is configured); otherwise they answer 501."""
     problems = settings.service_problems()
     if problems:
         raise ValueError("; ".join(problems))
     keyring, _ = parse_api_keys(settings.service_api_keys)
     service = ScanService.from_settings(settings, classifier=classifier)
+    fix_service = None
+    if settings.service_fixes_enabled:
+        from security_service.adapters.foundry_corrector import FoundryCorrector
+        from security_service.core.fix_service import FixService
+
+        fix_service = FixService(service, corrector or FoundryCorrector.from_settings(settings))
     gateway = Gateway(service, keyring, JobStore(settings.service_retention_hours * 3600), RateLimiter(settings.service_rate_limit_per_minute),
                       workers=settings.service_workers, max_wait_seconds=settings.service_max_wait_seconds,
-                      retention_hours=settings.service_retention_hours)
+                      retention_hours=settings.service_retention_hours, fix_service=fix_service, fix_workers=settings.service_fix_workers,
+                      fix_limiter=RateLimiter(settings.service_fix_rate_limit_per_minute))
     return create_app(gateway)

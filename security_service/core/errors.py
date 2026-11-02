@@ -52,6 +52,8 @@ _API_PROBLEMS = {
     "rate_limited": (429, "Too many requests"),
     "internal_error": (500, "Internal error"),
     "not_implemented": (501, "Not implemented"),
+    "scan_not_completed": (409, "Scan not completed"),
+    "fix_limit_reached": (409, "Fix limit reached"),
     "provider_unavailable": (503, "Service unavailable"),
 }
 
@@ -67,6 +69,8 @@ def api_problem(code: str, detail: str, request_id: str | None = None) -> dict[s
 
 def demo() -> None:
     assert api_problem("unauthorized", "x") == {"type": "about:blank", "title": "Unauthorized", "status": 401, "detail": "x", "code": "unauthorized"}
+    assert api_problem("fix_limit_reached", "z")["status"] == 409 and api_problem("fix_limit_reached", "z")["title"] == "Fix limit reached"
+    assert api_problem("scan_not_completed", "z")["status"] == 409 and api_problem("scan_not_completed", "z")["code"] == "scan_not_completed"
     assert api_problem("not_implemented", "y", "req_1")["status"] == 501 and api_problem("not_implemented", "y", "req_1")["request_id"] == "req_1"
     assert {code for code in _API_PROBLEMS} | {"payload_too_large", "unsupported_language", "invalid_request"} == set(_API_PROBLEMS)
     try:

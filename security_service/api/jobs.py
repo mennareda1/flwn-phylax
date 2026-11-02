@@ -13,6 +13,10 @@ What it guarantees:
     and by a periodic sweep). DELETE removes it at once, and a scan that finishes after being deleted is thrown away.
   - BOUNDS: at most `max_jobs` are held, so a flood of requests cannot use up all memory.
 
+FIXES AND VERIFICATIONS are children of a scan. They hold patches and corrected code, so they live exactly as long as the scan (never
+longer), are removed with it when it is deleted, and belong to the same caller. A scan may hold only a few fix requests, because each one
+costs a model call.
+
 A job's status describes the JOB, not the code: `completed` means the scan ran, even if its decision is scan_failed.
 `failed` means the job itself crashed.
 """
@@ -37,6 +41,10 @@ class StoreFull(Exception):
     """The store holds as many jobs as it is allowed to."""
 
 
+class TooManyFixes(Exception):
+    """This scan already has as many fix requests as one scan may have."""
+
+
 def iso(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -59,6 +67,7 @@ class ScanJob:
     report: dict | None = None
     deleted: bool = False
     done: threading.Event = field(default_factory=threading.Event)
+    findings: list | None = None            # the report's Finding objects, kept so fixes and verifications can compare against them
 
     def to_resource(self) -> dict:
         """The `Scan` object of the contract."""
@@ -72,8 +81,39 @@ class ScanJob:
         }
 
 
+_FIX_FAILED = "The fix job failed unexpectedly, so nothing was produced."
+
+
+@dataclass
+class ChildJob:
+    """A fix or a verification: a result that belongs to one scan."""
+    id: str
+    kind: str                               # "fix" | "verification"
+    owner: str
+    scan_id: str
+    created_at: float
+    expires_at: float
+    fingerprint: str
+    idempotency_key: str | None
+    status: str = "queued"
+    completed_at: float | None = None
+    result: dict | None = None              # the kind-specific fields of the resource, once completed
+    deleted: bool = False
+    done: threading.Event = field(default_factory=threading.Event)
+
+    def to_resource(self) -> dict:
+        """The `Fix` or `Verification` object of the contract."""
+        base = {"id": self.id, "scan_id": self.scan_id, "status": self.status, "created_at": iso(self.created_at),
+                "completed_at": iso(self.completed_at) if self.completed_at is not None else None}
+        done = self.result if self.status == "completed" and self.result is not None else None
+        if self.kind == "fix":
+            return {**base, **(done or {"patches": [], "verification": None, "applicable": False, "unfixed": [],
+                                         "failure_reason": _FIX_FAILED if self.status == "failed" else None})}
+        return {**base, **(done or {"outcome": None, "checks": [], "new_findings": [], "resolved_finding_ids": []})}
+
+
 class JobStore:
-    def __init__(self, retention_seconds: float, max_jobs: int = 5000, clock: Callable[[], float] = time.time):
+    def __init__(self, retention_seconds: float, max_jobs: int = 5000, clock: Callable[[], float] = time.time, max_fixes_per_scan: int = 5):
         if retention_seconds <= 0 or max_jobs < 1:
             raise ValueError("retention_seconds and max_jobs must be positive")
         self._retention = retention_seconds
@@ -81,6 +121,10 @@ class JobStore:
         self._clock = clock
         self._jobs: dict[str, ScanJob] = {}
         self._keys: dict[tuple[str, str], str] = {}     # (owner, Idempotency-Key) -> job id
+        self._children: dict[str, ChildJob] = {}
+        self._child_keys: dict[tuple[str, str, str], str] = {}          # (owner, kind, Idempotency-Key) -> child id
+        self._by_scan: dict[str, set[str]] = {}
+        self._max_fixes_per_scan = max_fixes_per_scan
         self._lock = threading.RLock()
 
     def __len__(self) -> int:
@@ -126,10 +170,10 @@ class JobStore:
             job.status = "running"
             return True
 
-    def complete(self, job: ScanJob, report: dict) -> None:
+    def complete(self, job: ScanJob, report: dict, findings: list | None = None) -> None:
         with self._lock:
             if not job.deleted:                 # a scan that finishes after DELETE is thrown away
-                job.report, job.status, job.completed_at = report, "completed", self._clock()
+                job.report, job.status, job.completed_at, job.findings = report, "completed", self._clock(), findings
             job.done.set()
 
     def fail(self, job: ScanJob) -> None:
@@ -159,9 +203,88 @@ class JobStore:
             self._drop_locked(job)
         return len(expired)
 
+    # ------------------------------------------------------------------ fixes and verifications (children of a scan)
+
+    def create_child(self, kind: str, owner: str, scan_id: str, fingerprint: str, idempotency_key: str | None) -> tuple[ChildJob, bool]:
+        """Returns (job, replayed). The scan must exist and belong to `owner` (the caller checks, with get()); the child expires with it."""
+        with self._lock:
+            self._purge_locked()
+            parent = self._jobs.get(scan_id)
+            if parent is None or parent.owner != owner:
+                raise LookupError("no such scan")
+            if idempotency_key:
+                earlier = self._children.get(self._child_keys.get((owner, kind, idempotency_key), ""))
+                if earlier is not None:
+                    if earlier.fingerprint != fingerprint:
+                        raise IdempotencyConflict()
+                    return earlier, True
+            if len(self._children) >= self._max_jobs:
+                raise StoreFull()
+            if kind == "fix" and sum(self._children[c].kind == "fix" for c in self._by_scan.get(scan_id, ())) >= self._max_fixes_per_scan:
+                raise TooManyFixes()
+            child = ChildJob(id=f"{'fix' if kind == 'fix' else 'ver'}_{secrets.token_hex(8)}", kind=kind, owner=owner, scan_id=scan_id,
+                             created_at=self._clock(), expires_at=parent.expires_at, fingerprint=fingerprint, idempotency_key=idempotency_key)
+            self._children[child.id] = child
+            self._by_scan.setdefault(scan_id, set()).add(child.id)
+            if idempotency_key:
+                self._child_keys[(owner, kind, idempotency_key)] = child.id
+            return child, False
+
+    def get_child(self, kind: str, child_id: str, owner: str) -> ChildJob | None:
+        with self._lock:
+            self._purge_locked()
+            child = self._children.get(child_id)
+            return child if child is not None and child.kind == kind and child.owner == owner else None
+
+    def mark_child_running(self, child: ChildJob) -> bool:
+        with self._lock:
+            if child.deleted:
+                return False
+            child.status = "running"
+            return True
+
+    def complete_child(self, child: ChildJob, result: dict) -> None:
+        with self._lock:
+            if not child.deleted:
+                child.result, child.status, child.completed_at = result, "completed", self._clock()
+            child.done.set()
+
+    def fail_child(self, child: ChildJob) -> None:
+        with self._lock:
+            if not child.deleted:
+                child.status, child.completed_at = "failed", self._clock()
+            child.done.set()
+
+    def add_verification(self, owner: str, scan_id: str, result: dict) -> dict | None:
+        """Record a verification that a fix has just made, so the one embedded in the fix can also be fetched by its own id.
+        Returns its resource (None if the scan is gone)."""
+        with self._lock:
+            parent = self._jobs.get(scan_id)
+            if parent is None or parent.owner != owner:
+                return None
+            now = self._clock()
+            child = ChildJob(id=f"ver_{secrets.token_hex(8)}", kind="verification", owner=owner, scan_id=scan_id, created_at=now,
+                             expires_at=parent.expires_at, fingerprint="", idempotency_key=None, status="completed", completed_at=now, result=result)
+            child.done.set()
+            self._children[child.id] = child
+            self._by_scan.setdefault(scan_id, set()).add(child.id)
+            return child.to_resource()
+
+    def child_count(self) -> int:
+        with self._lock:
+            return len(self._children)
+
     def _drop_locked(self, job: ScanJob) -> None:
+        for child_id in self._by_scan.pop(job.id, set()):          # the fixes and verifications go with their scan
+            child = self._children.pop(child_id, None)
+            if child is not None:
+                child.deleted, child.result = True, None
+                if child.idempotency_key:
+                    self._child_keys.pop((child.owner, child.kind, child.idempotency_key), None)
+                child.done.set()
         job.deleted = True
         job.files = None                        # the submitted code goes with the job
+        job.findings = None
         job.report = None
         self._jobs.pop(job.id, None)
         if job.idempotency_key:
@@ -254,6 +377,63 @@ def demo() -> None:
         raise AssertionError("a retention of zero must be refused")
     except ValueError:
         pass
+    # ---- fixes and verifications: children of a scan
+    now[0] = 10_000.0
+    kids = JobStore(retention_seconds=3600, max_jobs=50, clock=lambda: now[0], max_fixes_per_scan=2)
+    parent, _ = kids.create("alice", "fp", None, files, None, None, None, None)
+    fix1, replayed = kids.create_child("fix", "alice", parent.id, "body-1", "K")
+    assert replayed is False and fix1.id.startswith("fix_") and fix1.expires_at == parent.expires_at and fix1.status == "queued"
+    assert fix1.to_resource() == {"id": fix1.id, "scan_id": parent.id, "status": "queued", "created_at": "1970-01-01T02:46:40Z", "completed_at": None,
+                                  "patches": [], "verification": None, "applicable": False, "unfixed": [], "failure_reason": None}
+    again, replayed = kids.create_child("fix", "alice", parent.id, "body-1", "K")
+    assert replayed is True and again is fix1                                                    # a retry is the same fix
+    try:
+        kids.create_child("fix", "alice", parent.id, "different", "K")
+        raise AssertionError("expected a conflict")
+    except IdempotencyConflict:
+        pass
+    ver, replayed = kids.create_child("verification", "alice", parent.id, "body-1", "K")         # the same key for ANOTHER kind is a different job
+    assert replayed is False and ver.id.startswith("ver_") and ver.to_resource()["outcome"] is None and ver.to_resource()["checks"] == []
+
+    # the lifecycle, and ownership: only the owner sees it, and a fix is not found as a verification
+    assert kids.get_child("fix", fix1.id, "alice") is fix1 and kids.get_child("fix", fix1.id, "mallory") is None and kids.get_child("verification", fix1.id, "alice") is None
+    assert kids.mark_child_running(fix1) and fix1.status == "running"
+    kids.complete_child(fix1, {"patches": [{"path": "a.py"}], "verification": None, "applicable": True, "unfixed": [], "failure_reason": None})
+    assert fix1.to_resource()["status"] == "completed" and fix1.to_resource()["applicable"] is True and fix1.done.is_set()
+    broken = kids.create_child("fix", "alice", parent.id, "x", None)[0]
+    kids.fail_child(broken)
+    assert broken.to_resource()["status"] == "failed" and broken.to_resource()["patches"] == [] and "failed unexpectedly" in broken.to_resource()["failure_reason"]
+    try:                                                                                          # a scan may hold only a few fix requests (each costs a model call)
+        kids.create_child("fix", "alice", parent.id, "third", None)
+        raise AssertionError("expected TooManyFixes")
+    except TooManyFixes:
+        pass
+    assert kids.create_child("verification", "alice", parent.id, "v-2", None)[1] is False         # verifications are not capped this way
+    try:                                                                                          # nobody else's scan, and no scan at all
+        kids.create_child("fix", "mallory", parent.id, "x", None)
+        raise AssertionError("expected LookupError")
+    except LookupError:
+        pass
+    embedded = kids.add_verification("alice", parent.id, {"outcome": "passed", "checks": [], "new_findings": [], "resolved_finding_ids": ["f1"]})
+    assert embedded["id"].startswith("ver_") and embedded["status"] == "completed" and embedded["outcome"] == "passed" and embedded["scan_id"] == parent.id
+    assert kids.get_child("verification", embedded["id"], "alice") is not None and kids.add_verification("mallory", parent.id, {}) is None
+
+    # children die with their scan: on DELETE (and the idempotency keys they held are free again), and when the scan's retention ends
+    count_before = kids.child_count()
+    assert count_before >= 4
+    assert kids.delete(parent.id, "alice") and kids.child_count() == 0 and fix1.deleted and fix1.result is None
+    assert kids.create("alice", "fp", None, files, None, None, None, None)[0] is not None
+    second, _ = kids.create("alice", "fp2", None, files, None, None, None, None)
+    child, _ = kids.create_child("fix", "alice", second.id, "b", "K")
+    now[0] += 4000                                                                                # the scan expires; so does its child, never later
+    assert kids.get_child("fix", child.id, "alice") is None and child.deleted and kids.child_count() == 0
+    late_scan, _ = kids.create("alice", "fp3", None, files, None, None, None, None)
+    late_child, _ = kids.create_child("fix", "alice", late_scan.id, "c", None)
+    kids.delete(late_scan.id, "alice")
+    kids.mark_child_running(late_child)
+    kids.complete_child(late_child, {"patches": [{"path": "a.py"}]})                              # a fix that finishes after its scan was deleted is thrown away
+    assert late_child.result is None and late_child.status != "completed"
+
     print("api.jobs OK: ownership hides other callers' jobs, idempotency per caller, retention and delete remove the code, a late result cannot resurrect a deleted job")
 
 

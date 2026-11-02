@@ -58,6 +58,83 @@ def start(env_path: Path, clean: dict, cwd: str, port_env: dict | None = None):
                             stderr=subprocess.STDOUT, text=True, encoding="utf-8")
 
 
+def run_fixes(model, clean: dict, folder: str) -> None:
+    """A second real process: fixes switched ON, Decision-1 off, GPT-6 Astra played by the fake server. The whole fix flow over real sockets."""
+    port = free_port()
+    base = f"http://127.0.0.1:{port}"
+    env_path = Path(folder) / "fixes.env"
+    env_path.write_text("\n".join([
+        f"FOUNDRY_ENDPOINT=http://127.0.0.1:{model.server_address[1]}", f"FOUNDRY_API_KEY={GOOD_KEY}", "CORRECTOR_DEPLOYMENT=gpt-6-astra",
+        "SERVICE_FIXES_ENABLED=true", f"SERVICE_PORT={port}", f"SERVICE_API_KEYS=flwn-ai:scan+fix+read:{KEY_FLWN},viewer:read:{KEY_VIEWER}",
+        "SERVICE_RATE_LIMIT_PER_MINUTE=500", "SERVICE_MAX_WAIT_SECONDS=30"]) + "\n", encoding="utf-8")
+
+    # fixes switched on but no corrector settings: it refuses to start, in words
+    half = Path(folder) / "half.env"
+    half.write_text(f"SERVICE_PORT={port}\nSERVICE_FIXES_ENABLED=true\nSERVICE_API_KEYS=a:scan:{KEY_FLWN}\n", encoding="utf-8")
+    refused = subprocess.run([sys.executable, "-m", "security_service.api"], cwd=folder, capture_output=True, text=True, encoding="utf-8", timeout=60,
+                             env={**clean, "SECURITY_ENV_FILE": str(half), "PYTHONPATH": str(REPO_ROOT)})
+    assert refused.returncode == 4 and "SERVICE_FIXES_ENABLED is on but" in refused.stdout and "Traceback" not in refused.stdout + refused.stderr, refused.stdout + refused.stderr
+
+    proc = start(env_path, clean, folder)
+    output = ""
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                if request(base, "GET", "/healthz")[0] == 200:
+                    break
+            except (urllib.error.URLError, ConnectionError, OSError):
+                pass
+            assert proc.poll() is None, "the service exited while starting:\n" + (proc.stdout.read() if proc.stdout else "")
+            assert time.monotonic() < deadline, "the service did not start in 30 seconds"
+            time.sleep(0.2)
+
+        assert request(base, "GET", "/v1/capabilities", KEY_VIEWER)[1]["features"] == {"fixes": True, "verifications": True}
+        before = len(model.requests)
+        status, scan, _ = request(base, "POST", "/v1/scans", KEY_FLWN, {"files": [{"path": "bad.py", "content": CODE}]}, {"Prefer": "wait=30"})
+        assert status == 200 and scan["report"]["decision"] == "block" and len(model.requests) == before     # a rules-only scan never calls the model
+
+        # a viewer cannot ask for fixes, and a fix of someone else's scan is not found
+        assert request(base, "POST", f"/v1/scans/{scan['id']}/fixes", KEY_VIEWER, {})[0] == 403
+        assert len(model.requests) == before
+
+        # a real fix: one model call, with the code and without any service key; a patch that applies; a verification that passed
+        status, fix, headers = request(base, "POST", f"/v1/scans/{scan['id']}/fixes", KEY_FLWN, {}, {"Prefer": "wait=30", "Idempotency-Key": "fix-e2e"})
+        assert status == 200 and fix["status"] == "completed" and fix["applicable"] is True and fix["verification"]["outcome"] == "passed", (status, fix)
+        calls = [r for r in model.requests[before:] if r["path"].startswith("/openai/v1/chat/completions")]
+        assert len(calls) == 1 and calls[0]["body"]["model"] == "gpt-6-astra" and "os.system" in calls[0]["body"]["messages"][1]["content"]
+        assert KEY_FLWN not in json.dumps(model.requests[before:]) and KEY_VIEWER not in json.dumps(model.requests[before:])
+        from security_service.core.patching import apply_unified_diff
+
+        patched = apply_unified_diff(CODE, fix["patches"][0]["unified_diff"], "bad.py")
+        assert "subprocess.run" in patched and "os.system" not in patched
+        assert request(base, "GET", f"/v1/fixes/{fix['id']}", KEY_FLWN)[1] == fix
+        assert request(base, "GET", f"/v1/verifications/{fix['verification']['id']}", KEY_FLWN)[1] == fix["verification"]
+        assert request(base, "GET", f"/v1/fixes/{fix['id']}", KEY_VIEWER)[0] == 404
+
+        # a retry costs nothing: same fix, no second model call
+        status, again, headers = request(base, "POST", f"/v1/scans/{scan['id']}/fixes", KEY_FLWN, {}, {"Prefer": "wait=30", "Idempotency-Key": "fix-e2e"})
+        assert again["id"] == fix["id"] and headers["idempotency-replayed"] == "true" and len([r for r in model.requests[before:] if "chat" in r["path"]]) == 1
+
+        # verifying the caller's own correction needs no model at all
+        status, ver, _ = request(base, "POST", "/v1/verifications", KEY_FLWN, {"scan_id": scan["id"], "files": [{"path": "bad.py", "content": patched}]}, {"Prefer": "wait=30"})
+        assert status == 200 and ver["outcome"] == "passed" and len([r for r in model.requests[before:] if "chat" in r["path"]]) == 1
+
+        # the scan is deleted: its fix and verifications go with it
+        assert request(base, "DELETE", f"/v1/scans/{scan['id']}", KEY_FLWN)[0] == 204
+        assert request(base, "GET", f"/v1/fixes/{fix['id']}", KEY_FLWN)[0] == 404 and request(base, "GET", f"/v1/verifications/{ver['id']}", KEY_FLWN)[0] == 404
+    finally:
+        proc.terminate()
+        try:
+            output = proc.communicate(timeout=20)[0]
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            output = proc.communicate()[0]
+    assert "Fixes: ON, by gpt-6-astra" in output and f"POST /v1/scans/" in output and "/fixes -> 200" in output and "caller=flwn-ai" in output, output[-1500:]
+    for secret in (KEY_FLWN, KEY_VIEWER, GOOD_KEY, CANARY, "os.system", "subprocess.run"):
+        assert secret not in output, f"{secret[:12]!r} appeared in the service's output"
+
+
 def run() -> None:
     try:
         model = FakeDecision1()
@@ -169,8 +246,12 @@ def run() -> None:
         for secret in (KEY_FLWN, KEY_VIEWER, GOOD_KEY, CANARY, "os.system", "ping"):
             assert secret not in output, f"{secret[:12]!r} appeared in the service's output"
 
+    with tempfile.TemporaryDirectory() as second_folder:
+        run_fixes(model, clean, second_folder)
+
     print("check_service OK: the real process starts from a .env (BOM + CRLF), serves over real sockets, scans with the rules and Decision-1, replays a retry without a second model call, "
-          "limits an upload with or without Content-Length, refuses to start without a key or with a broken Decision-1 setup, and its output never holds a key or the submitted code")
+          "limits an upload with or without Content-Length, refuses to start without a key or with a broken Decision-1 setup, and its output never holds a key or the submitted code; "
+          "with fixes switched on it runs the whole fix flow (one model call, a patch that applies, a passed verification, a free retry, cleanup with the scan) and refuses to start half-configured")
 
 
 if __name__ == "__main__":

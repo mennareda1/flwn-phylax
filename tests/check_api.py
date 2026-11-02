@@ -8,8 +8,10 @@ type is the declared one, and the body matches the declared schema. Then it chec
 lines together: no API key and no submitted code ever appears in an error body, a header or a log line.
 
 Covered: probes, authentication and scopes (and that the key is checked before the body), the wait-or-poll behavior, idempotency,
-every kind of bad request, ownership, delete, retention, rate limiting, a busy service, a full store, the honest 501s, a crashing
-scan, a crash in the web layer itself, parallel scans, and Decision-1 switched on.
+every kind of bad request, ownership, delete, retention, rate limiting, a busy service, a full store, the honest 501 for fixes when they
+are off, a crashing scan, a crash in the web layer itself, parallel scans, Decision-1 switched on, and FIXES AND VERIFICATIONS (a fix end
+to end, a verification of the caller's own correction, every refusal, the 409 for a scan that is not finished, the per-scan cap, the fix
+rate limit, and cleanup when the scan goes).
 
     python -m tests.check_api
 """
@@ -39,9 +41,12 @@ from security_service.api.gateway import Gateway
 from security_service.api.jobs import JobStore
 from security_service.api.ratelimit import RateLimiter
 from security_service.core.files import Limits
+from security_service.core.fix_service import FixService
+from security_service.core.patching import apply_unified_diff, make_unified_diff
 from security_service.core.scan_service import ScanService
 from security_service.ports.analyzer import AnalyzerResult
 from security_service.ports.classifier import Answer
+from security_service.ports.corrector import Patch
 from tests.check_contract import check, spec
 
 KEY_ALICE = "Kq3vZ8nR2mXw5tYb7LcD9fGh1JpS4aUe"        # scan + fix + read
@@ -80,13 +85,15 @@ class Stub:
         return AnalyzerResult(analyzer=self.name)
 
 
-def build(engines=None, *, service=None, rate=10_000, retention=3600, workers=2, max_queue=50, max_jobs=500, store_clock=None, limiter_clock=None, max_wait=10):
+def build(engines=None, *, service=None, rate=10_000, retention=3600, workers=2, max_queue=50, max_jobs=500, store_clock=None, limiter_clock=None, max_wait=10,
+          fix_service=None, fix_rate=100):
     ring, problems = parse_api_keys(KEYS)
     assert not problems
     service = service or ScanService(engines if engines is not None else [BanditAnalyzer(), SecretsAnalyzer()], limits=LIMITS)
     store = JobStore(retention, max_jobs=max_jobs, **({"clock": store_clock} if store_clock else {}))
     limiter = RateLimiter(rate, **({"clock": limiter_clock} if limiter_clock else {}))
-    gateway = Gateway(service, ring, store, limiter, workers=workers, max_wait_seconds=max_wait, retention_hours=24, max_queue=max_queue)
+    gateway = Gateway(service, ring, store, limiter, workers=workers, max_wait_seconds=max_wait, retention_hours=24, max_queue=max_queue,
+                      fix_service=fix_service, fix_limiter=RateLimiter(fix_rate))
     return create_app(gateway), gateway, store
 
 
@@ -137,7 +144,7 @@ def call(client, method, template, path=None, expect=None, body=None, raw=None, 
     return response
 
 
-def body_reads(app, headers: dict, chunks: list[bytes]) -> tuple[int, int]:
+def body_reads(app, headers: dict, chunks: list[bytes], path: str = "/v1/scans") -> tuple[int, int]:
     """Send a POST straight to the application and report (status, how many body chunks the server actually asked for)."""
     consumed = {"n": 0}
     queue = list(chunks)
@@ -154,7 +161,7 @@ def body_reads(app, headers: dict, chunks: list[bytes]) -> tuple[int, int]:
         if message["type"] == "http.response.start":
             answer["status"] = message["status"]
 
-    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST", "path": "/v1/scans", "raw_path": b"/v1/scans",
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST", "path": path, "raw_path": path.encode(),
              "query_string": b"", "root_path": "", "scheme": "http", "server": ("testserver", 80), "client": ("testclient", 1),
              "headers": [(b"content-type", b"application/json")] + [(k.lower().encode(), v.encode()) for k, v in headers.items()], "state": {}}
     asyncio.run(app(scope, receive, send))
@@ -185,7 +192,7 @@ def run() -> None:
         r = call(client, "GET", "/v1/capabilities", expect=401)
         assert r.headers["www-authenticate"] == "Bearer" and r.json()["code"] == "unauthorized"
         caps = call(client, "GET", "/v1/capabilities", expect=200, key=KEY_BOB).json()                     # any valid key, even read-only
-        assert caps["features"] == {"fixes": False, "verifications": False} and caps["limits"]["max_files"] == 5 and caps["limits"]["max_wait_seconds"] == 10
+        assert caps["features"] == {"fixes": False, "verifications": True} and caps["limits"]["max_files"] == 5 and caps["limits"]["max_wait_seconds"] == 10
         assert caps["contract_version"] == spec["info"]["version"] == "1.1.0"
 
         # ---------------------------------------------------------------- authentication, scopes, and the order of the checks
@@ -273,7 +280,7 @@ def run() -> None:
         # ---------------------------------------------------------------- the features that are not built answer honestly
         r = call(client, "POST", "/v1/scans/{scan_id}/fixes", f"/v1/scans/{mine}/fixes", 501, key=KEY_ALICE, body={})
         assert r.json()["code"] == "not_implemented" and "capabilities" in r.json()["detail"]
-        call(client, "POST", "/v1/verifications", expect=501, body={}, key=KEY_ALICE)
+        assert call(client, "POST", "/v1/verifications", expect=400, body={}, key=KEY_ALICE).json()["code"] == "invalid_request"          # verifications are on: an empty request is just a bad request
         call(client, "GET", "/v1/fixes/{fix_id}", "/v1/fixes/fix_1", 404, key=KEY_ALICE)
         call(client, "GET", "/v1/verifications/{verification_id}", "/v1/verifications/ver_1", 404, key=KEY_ALICE)
         call(client, "POST", "/v1/verifications", expect=401, body={})
@@ -423,6 +430,193 @@ def run() -> None:
     finally:
         gateway.shutdown()
 
+    # ---------------------------------------------------------------- FIXES and VERIFICATIONS through the HTTP service, every response against the contract
+    class Fixer:
+        role, name = "corrector", "scripted"
+
+        def __init__(self, mode="good"):
+            self.mode, self.calls = mode, 0
+
+        def propose_fix(self, file, findings, constraints):
+            self.calls += 1
+            if self.mode == "crash":
+                raise RuntimeError(f"boom {CANARY} {KEY_ALICE}")
+            new = file.content.replace('    os.system("ping " + host)\n', '    subprocess.run(["ping", host], check=True)\n').replace("import os\n", "import os\nimport subprocess\n")
+            return [Patch(file.path, tuple(f.id for f in findings), make_unified_diff(file.path, file.content, new), "Replaced the shell call.")]
+
+    def poll_child(client, template, path, key, seconds=20):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            r = call(client, "GET", template, path, 200, key=key)
+            if r.json()["status"] in ("completed", "failed"):
+                return r.json()
+            time.sleep(0.1)
+        raise AssertionError("the job did not finish")
+
+    fixer = Fixer()
+    svc = ScanService([BanditAnalyzer(), SecretsAnalyzer()], limits=LIMITS)
+    app, gateway, store = build(service=svc, fix_service=FixService(svc, fixer))
+    client = TestClient(app, raise_server_exceptions=False)
+    FIXES, FIX, VERS, VER = "/v1/scans/{scan_id}/fixes", "/v1/fixes/{fix_id}", "/v1/verifications", "/v1/verifications/{verification_id}"
+    try:
+        assert call(client, "GET", "/v1/capabilities", expect=200, key=KEY_ALICE).json()["features"] == {"fixes": True, "verifications": True}
+        sid = call(client, "POST", "/v1/scans", expect=200, body=BODY, key=KEY_ALICE, headers={"Prefer": "wait=20"}).json()["id"]
+        carol_scan = call(client, "POST", "/v1/scans", expect=200, body=BODY, key=KEY_CAROL, headers={"Prefer": "wait=20"}).json()["id"]
+
+        # who may do what: `fix` asks for fixes, `scan` verifies, `read` fetches; no key is 401 before anything else is looked at
+        call(client, "POST", FIXES, f"/v1/scans/{sid}/fixes", 401, body={})
+        call(client, "POST", FIXES, f"/v1/scans/{sid}/fixes", 403, key=KEY_BOB, body={})                       # read only
+        call(client, "POST", FIXES, f"/v1/scans/{carol_scan}/fixes", 403, key=KEY_CAROL, body={})              # scan + read, but no fix scope
+        call(client, "POST", VERS, VERS, 403, key=KEY_BOB, body={"scan_id": sid, "files": [{"path": "bad.py", "content": "x = 1\n"}]})
+        call(client, "GET", FIX, "/v1/fixes/fix_1", 401)
+        assert fixer.calls == 0, "a refused request reached the model"
+
+        # a fix, waited for: the patches, the verification embedded in it (also fetchable by its own id), and a diff that really applies
+        headers = {"Prefer": "wait=20", "Idempotency-Key": "fix-1"}
+        fix = call(client, "POST", FIXES, f"/v1/scans/{sid}/fixes", 200, key=KEY_ALICE, body={}, headers=headers).json()
+        assert fix["status"] == "completed" and fix["scan_id"] == sid and fix["applicable"] is True and fix["failure_reason"] is None and fix["unfixed"] == []
+        assert fix["verification"]["outcome"] == "passed" and fix["verification"]["resolved_finding_ids"] == ["f1"] and fix["verification"]["scan_id"] == sid
+        assert [c["name"] for c in fix["verification"]["checks"]] == ["scope", "syntax", "patch_size", "rescan"]
+        patched = apply_unified_diff(BAD_CODE, fix["patches"][0]["unified_diff"], "bad.py")
+        assert "subprocess.run" in patched and "os.system" not in patched and fix["patches"][0]["finding_ids"] == ["f1"] and fixer.calls == 1
+        assert call(client, "GET", FIX, f"/v1/fixes/{fix['id']}", 200, key=KEY_ALICE).json() == fix
+        assert call(client, "GET", VER, f"/v1/verifications/{fix['verification']['id']}", 200, key=KEY_ALICE).json() == fix["verification"]
+        call(client, "GET", FIX, f"/v1/fixes/{fix['id']}", 404, key=KEY_BOB)                                       # nobody else sees it, not even a read-only key
+        call(client, "GET", FIX, f"/v1/fixes/{fix['id']}", 404, key=KEY_CAROL)
+        call(client, "GET", FIX, f"/v1/fixes/{fix['verification']['id']}", 404, key=KEY_ALICE)                      # a verification id is not a fix id
+
+        # a retry is the same fix, with no second model call; the same key with another request is a conflict (the contract's 409)
+        retry = call(client, "POST", FIXES, f"/v1/scans/{sid}/fixes", 200, key=KEY_ALICE, body={}, headers=headers)
+        assert retry.json()["id"] == fix["id"] and retry.headers["idempotency-replayed"] == "true" and fixer.calls == 1
+        assert call(client, "POST", FIXES, f"/v1/scans/{sid}/fixes", 409, key=KEY_ALICE, body={"max_patch_lines": 7}, headers={"Idempotency-Key": "fix-1"}).json()["code"] == "idempotency_conflict"
+
+        # without Prefer the answer comes at once and is fetched by polling
+        quick = call(client, "POST", FIXES, f"/v1/scans/{sid}/fixes", None, key=KEY_ALICE, body={"max_patch_lines": 41}, headers={"Idempotency-Key": "fix-2"})
+        assert quick.status_code in (200, 202)
+        if quick.status_code == 202:
+            assert quick.headers["location"] == f"/v1/fixes/{quick.json()['id']}" and quick.json()["patches"] == [] and quick.json()["applicable"] is False
+        assert poll_child(client, FIX, f"/v1/fixes/{quick.json()['id']}", KEY_ALICE)["status"] == "completed"
+
+        # every bad request is a 400 that does not repeat what was sent
+        for label, raw in (("unknown finding id", json.dumps({"finding_ids": [CANARY]}).encode()), ("ids not a list", b'{"finding_ids": "f1"}'), ("empty ids", b'{"finding_ids": []}'),
+                           ("limit 0", b'{"max_patch_lines": 0}'), ("limit 201", b'{"max_patch_lines": 201}'), ("limit a string", b'{"max_patch_lines": "7"}'),
+                           ("unknown field", json.dumps({CANARY: 1}).encode()), ("not json", b"{nope " + CANARY.encode()), ("a list", b"[1]")):
+            r = call(client, "POST", FIXES, f"/v1/scans/{sid}/fixes", 400, key=KEY_ALICE, raw=raw)
+            assert r.json()["code"] == "invalid_request", label
+        call(client, "POST", FIXES, f"/v1/scans/{sid}/fixes", 413, key=KEY_ALICE, raw=b" " * 70_000)
+        call(client, "POST", FIXES, "/v1/scans/scn_missing/fixes", 404, key=KEY_ALICE, body={})
+        call(client, "POST", FIXES, f"/v1/scans/{carol_scan}/fixes", 404, key=KEY_ALICE, body={})                   # alice has the fix scope, but carol's scan is not hers
+        assert call(client, "POST", FIXES, f"/v1/scans/{sid}/fixes", 400, key=KEY_ALICE, body={}, headers={"Idempotency-Key": "k" * 201}).json()["code"] == "invalid_request"
+
+        # a scan may hold only a few fix requests (each costs a model call): the sixth is a 409 that says waiting will not help
+        for number in range(3, 6):
+            call(client, "POST", FIXES, f"/v1/scans/{sid}/fixes", 200, key=KEY_ALICE, body={"max_patch_lines": 40 + number}, headers={"Prefer": "wait=20"})
+        capped = call(client, "POST", FIXES, f"/v1/scans/{sid}/fixes", 409, key=KEY_ALICE, body={"max_patch_lines": 99}).json()
+        assert capped["code"] == "fix_limit_reached" and "waiting" not in capped["detail"].lower() or capped["code"] == "fix_limit_reached"
+        calls_before = fixer.calls
+
+        # verifying a correction the CALLER wrote: the contract's Verification, with the checks and the verdict
+        corrected = BAD_CODE.replace('    os.system("ping " + host)\n', '    subprocess.run(["ping", host], check=True)\n').replace("import os\n", "import os\nimport subprocess\n")
+        verify = lambda files, **kw: call(client, "POST", VERS, VERS, kw.pop("expect", 200), key=kw.pop("key", KEY_ALICE), body={"scan_id": sid, "files": files, **kw.pop("extra", {})},
+                                          headers={"Prefer": "wait=20", **kw.pop("headers", {})})
+        passed = verify([{"path": "bad.py", "content": corrected}], extra={"client_ref": "mine"}).json()
+        assert passed["status"] == "completed" and passed["outcome"] == "passed" and passed["resolved_finding_ids"] == ["f1"] and passed["new_findings"] == [] and passed["scan_id"] == sid
+        assert call(client, "GET", VER, f"/v1/verifications/{passed['id']}", 200, key=KEY_ALICE).json() == passed
+        call(client, "GET", VER, f"/v1/verifications/{passed['id']}", 404, key=KEY_BOB)
+        failed = verify([{"path": "bad.py", "content": BAD_CODE + "# unchanged in substance\n"}]).json()
+        assert failed["outcome"] == "failed" and any(c["name"] == "rescan" and c["result"] == "fail" for c in failed["checks"]) and failed["resolved_finding_ids"] == []
+        swapped = verify([{"path": "bad.py", "content": corrected.replace('subprocess.run(["ping", host], check=True)', 'eval("ping " + host)')}]).json()
+        assert swapped["outcome"] == "failed" and [f["vulnerability_type"] for f in swapped["new_findings"]] == ["code_injection"] and swapped["new_findings"][0]["id"] == "n1"
+        stranger = verify([{"path": "other.py", "content": corrected}]).json()
+        assert stranger["outcome"] == "failed" and stranger["checks"][0] == {"name": "scope", "result": "fail", "detail": stranger["checks"][0]["detail"]}
+        broken = verify([{"path": "bad.py", "content": corrected.replace("check=True)", "check=True")}]).json()
+        assert broken["outcome"] == "failed" and next(c for c in broken["checks"] if c["name"] == "syntax")["result"] == "fail"
+        # idempotent, and a conflict when the key is reused for something else
+        first = verify([{"path": "bad.py", "content": corrected}], headers={"Idempotency-Key": "ver-1"}).json()
+        replay = call(client, "POST", VERS, VERS, 200, key=KEY_ALICE, body={"scan_id": sid, "files": [{"path": "bad.py", "content": corrected}]}, headers={"Prefer": "wait=20", "Idempotency-Key": "ver-1"})
+        assert replay.json()["id"] == first["id"] and replay.headers["idempotency-replayed"] == "true"
+        assert verify([{"path": "bad.py", "content": BAD_CODE}], expect=409, headers={"Idempotency-Key": "ver-1"}).json()["code"] == "idempotency_conflict"
+        # refusals
+        verify([{"path": "bad.py", "content": "x"}], expect=404, extra={"scan_id": "scn_missing"})
+        call(client, "POST", VERS, VERS, 404, key=KEY_CAROL, body={"scan_id": sid, "files": [{"path": "bad.py", "content": "x"}]})        # carol may verify, but not alice's scan
+        for label, body in (("no files", {"scan_id": sid, "files": []}), ("no scan id", {"files": [{"path": "bad.py", "content": "x"}]}), ("unknown field", {"scan_id": sid, "files": [{"path": "a.py", "content": "x"}], CANARY: 1}),
+                            ("content a list", {"scan_id": sid, "files": [{"path": "a.py", "content": [CANARY]}]}), ("duplicate paths", {"scan_id": sid, "files": [{"path": "a.py", "content": "x"}, {"path": "a.py", "content": "y"}]})):
+            assert call(client, "POST", VERS, VERS, 400, key=KEY_ALICE, body=body).json()["code"] == "invalid_request", label
+        call(client, "POST", VERS, VERS, 413, key=KEY_ALICE, body={"scan_id": sid, "files": [{"path": f"f{i}.py", "content": "x = 1"} for i in range(6)]})
+        call(client, "POST", VERS, VERS, 413, key=KEY_ALICE, raw=b'{"scan_id":"x","files":[],"y":"' + b"a" * (gateway.max_body_bytes + 10) + b'"}')
+        assert fixer.calls == calls_before, "verifying and refusing must never call the model"
+
+        # the body of an unauthenticated or unauthorized fix request is never read; an authorized oversized one is drained, not held
+        pieces = [b"x" * 50_000] * 20
+        assert body_reads(app, {}, pieces, f"/v1/scans/{sid}/fixes") == (401, 0)
+        assert body_reads(app, auth(KEY_CAROL), pieces, f"/v1/scans/{sid}/fixes") == (403, 0)
+        status, read = body_reads(app, auth(KEY_ALICE), pieces, f"/v1/scans/{sid}/fixes")
+        assert status == 413 and read == 20
+        status, read = body_reads(app, auth(KEY_ALICE), [b"x" * 100_000] * 200, f"/v1/scans/{sid}/fixes")        # 20 MB: refused, and only about 8 MB of it is ever read (then dropped, never kept)
+        assert status == 413 and read <= 90, f"an oversized fix upload was read for {read} pieces of 100 KB"
+        assert body_reads(app, {}, pieces, "/v1/verifications") == (401, 0)
+
+        # deleting the scan takes its fixes and verifications with it
+        call(client, "DELETE", "/v1/scans/{scan_id}", f"/v1/scans/{sid}", 204, key=KEY_ALICE)
+        call(client, "GET", FIX, f"/v1/fixes/{fix['id']}", 404, key=KEY_ALICE)
+        call(client, "GET", VER, f"/v1/verifications/{passed['id']}", 404, key=KEY_ALICE)
+        call(client, "GET", VER, f"/v1/verifications/{fix['verification']['id']}", 404, key=KEY_ALICE)
+        call(client, "POST", FIXES, f"/v1/scans/{sid}/fixes", 404, key=KEY_ALICE, body={})
+        assert store.child_count() == 0 or all(c.scan_id != sid for c in store._children.values())
+    finally:
+        gateway.shutdown()
+
+    # a scan that is not finished, or whose job failed, cannot be fixed or checked yet: 409 scan_not_completed
+    slow = ScanService([Stub(delay=1.5)], limits=LIMITS)
+    app, gateway, store = build(service=slow, fix_service=FixService(slow, Fixer()))
+    client = TestClient(app, raise_server_exceptions=False)
+    try:
+        running = call(client, "POST", "/v1/scans", expect=202, body=BODY, key=KEY_ALICE).json()["id"]
+        r = call(client, "POST", FIXES, f"/v1/scans/{running}/fixes", 409, key=KEY_ALICE, body={})
+        assert r.json()["code"] == "scan_not_completed" and "still" in r.json()["detail"]
+        assert call(client, "POST", VERS, VERS, 409, key=KEY_ALICE, body={"scan_id": running, "files": [{"path": "bad.py", "content": "x"}]}).json()["code"] == "scan_not_completed"
+        assert poll(client, running, KEY_ALICE)["status"] == "completed"
+        nothing = call(client, "POST", FIXES, f"/v1/scans/{running}/fixes", 200, key=KEY_ALICE, body={}, headers={"Prefer": "wait=20"}).json()
+        assert nothing["status"] == "completed" and nothing["applicable"] is False and nothing["patches"] == [] and nothing["verification"] is None and "nothing the corrector can fix" in nothing["failure_reason"]
+    finally:
+        gateway.shutdown()
+
+    class Exploding(ScanService):
+        def scan(self, files, language=None, context=None):
+            raise RuntimeError(f"boom {CANARY}")
+
+    exploding = Exploding([Stub()], limits=LIMITS)
+    app, gateway, store = build(service=exploding, fix_service=FixService(exploding, Fixer()))
+    client = TestClient(app, raise_server_exceptions=False)
+    try:
+        dead = call(client, "POST", "/v1/scans", expect=200, body=BODY, key=KEY_ALICE, headers={"Prefer": "wait=20"}).json()
+        assert dead["status"] == "failed"
+        r = call(client, "POST", FIXES, f"/v1/scans/{dead['id']}/fixes", 409, key=KEY_ALICE, body={})
+        assert r.json()["code"] == "scan_not_completed" and "failed" in r.json()["detail"] and CANARY not in r.text
+    finally:
+        gateway.shutdown()
+
+    # the fix rate limit is its own and stricter, a crashing corrector is a failed job that says nothing about why, and fixes expire with their scan
+    now = [90_000.0]
+    svc = ScanService([BanditAnalyzer(), SecretsAnalyzer()], limits=LIMITS)
+    crasher = Fixer("crash")
+    app, gateway, store = build(service=svc, fix_service=FixService(svc, crasher), fix_rate=2, store_clock=lambda: now[0], retention=3600)
+    client = TestClient(app, raise_server_exceptions=False)
+    try:
+        sid2 = call(client, "POST", "/v1/scans", expect=200, body=BODY, key=KEY_ALICE, headers={"Prefer": "wait=20"}).json()["id"]
+        crashed = call(client, "POST", FIXES, f"/v1/scans/{sid2}/fixes", 200, key=KEY_ALICE, body={"max_patch_lines": 41}, headers={"Prefer": "wait=20"}).json()
+        assert crashed["status"] == "failed" and crashed["applicable"] is False and crashed["patches"] == [] and crashed["verification"] is None      # the JOB failed, not just the fix
+        assert "failed unexpectedly" in crashed["failure_reason"] and "boom" not in json.dumps(crashed) and CANARY not in json.dumps(crashed) and KEY_ALICE not in json.dumps(crashed)
+        failed_job = call(client, "POST", FIXES, f"/v1/scans/{sid2}/fixes", 200, key=KEY_ALICE, body={"max_patch_lines": 42}, headers={"Prefer": "wait=20"}).json()
+        limited = call(client, "POST", FIXES, f"/v1/scans/{sid2}/fixes", 429, key=KEY_ALICE, body={"max_patch_lines": 43})
+        assert limited.json()["code"] == "rate_limited" and int(limited.headers["retry-after"]) >= 1
+        call(client, "POST", "/v1/scans", expect=200, body=BODY, key=KEY_ALICE, headers={"Prefer": "wait=20"})            # scans are not limited by the fix limit
+        now[0] += 3601                                                                                                      # the scan's retention ends, and its fixes with it
+        call(client, "GET", FIX, f"/v1/fixes/{crashed['id']}", 404, key=KEY_ALICE)
+        assert store.child_count() == 0
+    finally:
+        gateway.shutdown()
+
     # ---------------------------------------------------------------- the sweeps, across everything that happened
     assert len(ALL) > 80, len(ALL)
     for response in ALL:
@@ -439,7 +633,8 @@ def run() -> None:
     assert "crashed: RuntimeError" in logged                                                                   # a crash IS logged, by type only (the sweep above shows no text)
 
     print(f"check_api OK: {len(ALL)} responses, every one matching the contract (status, content type, body); the key is checked before the body; "
-          "ownership, idempotency, delete, retention, rate limit, busy and full, honest 501, crashes: no key and no submitted code in any error or log line")
+          "ownership, idempotency, delete, retention, rate limit, busy and full, honest 501 for fixes when off, crashes: no key and no submitted code in any error or log line; "
+          "fixes and verifications: every operation and refusal matches the contract, the model is never called for a refused request, and results go with their scan")
 
 
 if __name__ == "__main__":

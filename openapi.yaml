@@ -122,7 +122,10 @@ paths:
       tags: [fixes]
       operationId: createFix
       summary: Ask for fixes for findings of a finished scan
-      description: Requires scope `fix`. The scan must be completed.
+      description: >-
+        Requires scope `fix`. The scan must be completed (otherwise 409 `scan_not_completed`). The service asks the corrector for a patch per
+        file, then verifies the patches itself, so `applicable` is true only when verification passed. Nothing is ever applied. A fix request
+        costs money (a model call per file), so it is rate limited more strictly than other operations.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/Prefer'
@@ -150,7 +153,8 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
-        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
         '429': {$ref: '#/components/responses/RateLimited'}
         '501': {$ref: '#/components/responses/NotImplemented'}
         '503': {$ref: '#/components/responses/Unavailable'}
@@ -184,6 +188,8 @@ paths:
         the original findings should be gone, and nothing new at medium severity or above may appear.
         A new finding that only a model suspects (evidence_tier model_suspicion) is listed in `new_findings` for review
         but does not fail the `rescan` check: a model alone never blocks.
+        The scan must be completed (otherwise 409 `scan_not_completed`). Every finding at medium severity or above in a changed file
+        is expected to be gone. The `patch_size` check allows up to 200 changed lines here, because the caller wrote the correction.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/Prefer'
@@ -211,6 +217,7 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
         '429': {$ref: '#/components/responses/RateLimited'}
         '501': {$ref: '#/components/responses/NotImplemented'}
@@ -370,6 +377,16 @@ components:
           schema: {$ref: '#/components/schemas/Problem'}
     Unavailable:
       description: The service cannot do the work right now. Retry with backoff.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+
+    Conflict:
+      description: >-
+        The request conflicts with the current state. See `code`: `idempotency_conflict` (the Idempotency-Key was used before with a
+        different body), `scan_not_completed` (the scan is still queued or running, or its job failed, so there is nothing to fix or
+        check yet: wait for status `completed`), or `fix_limit_reached` (this scan already holds as many fix requests as one scan may,
+        because each costs a model call: waiting will not help, scan the code again).
       content:
         application/problem+json:
           schema: {$ref: '#/components/schemas/Problem'}
@@ -868,6 +885,8 @@ components:
             - provider_unavailable
             - internal_error
             - not_implemented
+            - scan_not_completed
+            - fix_limit_reached
         request_id: {type: string}
       examples:
         - type: about:blank
