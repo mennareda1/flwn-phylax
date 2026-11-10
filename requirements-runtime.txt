@@ -1,0 +1,9 @@
+# What the DEPLOYED service needs, and nothing else (the container installs this; requirements.txt also holds the test tools).
+# Versions are pinned in constraints-runtime.txt, so every build of the image uses exactly the versions that were tested.
+bandit
+tree-sitter
+tree-sitter-javascript
+tree-sitter-typescript
+tree-sitter-java
+fastapi
+uvicorn

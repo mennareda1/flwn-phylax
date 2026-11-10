@@ -1,0 +1,19 @@
+# Keep the build small and make sure nothing private can ever be copied into an image.
+.git
+.github
+.env
+.env.*
+!.env.example
+**/.env
+**/node_modules
+**/dist
+**/__pycache__
+*.pyc
+*.zip
+clients
+tests
+benchmark
+deploy
+classifier_eval_*
+.venv
+venv

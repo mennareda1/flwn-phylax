@@ -91,6 +91,10 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 process.kill()
             model.shutdown()
+            log_path = os.environ.get("PHYLAX_HELPER_LOG")          # a test that wants the service's own account of what happened names a file
+            if log_path:
+                time.sleep(0.3)
+                Path(log_path).write_text("".join(output)[-6000:], encoding="utf-8", errors="replace")
     return 0
 
 

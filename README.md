@@ -123,6 +123,17 @@ Which findings are offered a correction is decided by the service, per finding, 
 reported only; a hardcoded secret never. It does not depend on the verdict: a medium finding is offered when the decision is only `review_required`, and a `block` does
 not make a low finding eligible.
 
+## Deploying it
+
+Phylax ships as one container: `Dockerfile` (a pinned Python base, the exact package versions in `constraints-runtime.txt`, a non-root user, a health check, no secret baked in).
+GitHub Actions runs every check on each push (`.github/workflows/ci.yml`), and publishes the image to the GitHub Container Registry when you push a version tag, after starting
+the image itself and running `deploy/smoke.py` against it (`.github/workflows/publish.yml`). `deploy/azure/README.md` is the step-by-step guide for Azure Container Apps (run ONE
+copy: scans are kept in memory), and `deploy/azure/production.env.example` lists every setting. After a deployment, `python deploy/smoke.py --url https://...` checks that it works.
+
+Production setup: corrections ON (each one is a paid model call, with its own strict rate limit), Decision-1 ON for Python only (the languages that have passed a held-out
+evaluation; every other language is covered by the rules alone until it passes its own). Phylax never changes a file, so switching corrections on does not let anyone change code
+without a person approving it in the client. `python -m tests.check_deploy` keeps all of this honest.
+
 ## Applying a fix exactly (for tools like Oqelira's apply_file_change)
 
 Oqelira's `applyFileChange` takes the WHOLE new file plus the SHA-256 of the file it expects to replace, not a diff, and refuses if the file

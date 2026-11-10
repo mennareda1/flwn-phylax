@@ -36,6 +36,27 @@ from security_service.core.schema import (
 )
 
 BANDIT_TIMEOUT_SECONDS = 30
+# Developer settings that change how a Python program starts (extra import folders, a start-up script, an interactive prompt afterwards). The service may be run with
+# them while it is being developed; the engine it launches must not inherit them.
+_NOT_FOR_THE_CHILD = ("PYTHONPATH", "PYTHONSTARTUP", "PYTHONINSPECT")
+
+
+def child_environment() -> dict[str, str]:
+    """The environment Bandit is started with: the service's own, minus the developer settings above, with UTF-8 forced."""
+    env = {name: value for name, value in os.environ.items() if name.upper() not in _NOT_FOR_THE_CHILD}
+    env["PYTHONUTF8"] = "1"
+    return env
+
+
+def _said_before_stalling(exc: "subprocess.TimeoutExpired") -> str:
+    """Whatever Bandit printed before it was stopped, in a few safe words, so that a stall explains itself instead of just saying 'timed out'."""
+    parts = []
+    for stream in (exc.stderr, exc.stdout):
+        text = stream.decode("utf-8", "replace") if isinstance(stream, bytes) else (stream or "")
+        text = " ".join(text.split())
+        if text:
+            parts.append(text[:200])
+    return f" (it printed: {' | '.join(parts)})" if parts else " (it printed nothing before it was stopped)"
 
 # Rule-specific mapping wins over CWE mapping, because Bandit's CWE tags are
 # coarse (e.g. it tags eval() with CWE-78, the OS-command-injection id).
@@ -101,7 +122,7 @@ class BanditAnalyzer:
         if language not in self.languages:
             return done(error=f"bandit does not support language {language!r}")
 
-        env = dict(os.environ, PYTHONUTF8="1")
+        env = child_environment()
         with tempfile.TemporaryDirectory(prefix="flwn_scan_") as tmp:
             path = Path(tmp) / "snippet.py"
             with open(path, "w", encoding="utf-8", newline="") as handle:
@@ -112,9 +133,10 @@ class BanditAnalyzer:
                 proc = subprocess.run(
                     cmd, capture_output=True, text=True, encoding="utf-8",
                     timeout=BANDIT_TIMEOUT_SECONDS, env=env, cwd=tmp,
+                    stdin=subprocess.DEVNULL,                # the service's own input is never handed to a child: a child that waits on it would wait forever
                 )
-            except subprocess.TimeoutExpired:
-                return done(error=f"bandit timed out after {BANDIT_TIMEOUT_SECONDS}s")
+            except subprocess.TimeoutExpired as exc:
+                return done(error=f"bandit timed out after {BANDIT_TIMEOUT_SECONDS}s" + _said_before_stalling(exc))
             except OSError as exc:
                 return done(error=f"could not start bandit: {exc}")
 
@@ -151,3 +173,69 @@ class BanditAnalyzer:
             ))
         findings.sort(key=lambda f: (f.line or 0, f.rule_id or ""))
         return done(findings=findings)
+
+
+def demo() -> None:
+    """The launch is hardened, a stall explains itself, and the real Bandit still works with the developer settings present."""
+    import tempfile
+
+    analyzer = BanditAnalyzer()
+    real_run, seen = subprocess.run, {}
+
+    class Done:
+        returncode, stderr, stdout = 0, "", '{"results": [], "errors": []}'
+
+    def spy(cmd, **kwargs):
+        seen.update(kwargs, cmd=cmd)
+        return Done()
+
+    saved = {name: os.environ.get(name) for name in ("PYTHONPATH", "PYTHONSTARTUP", "PYTHONINSPECT", "PHYLAX_DEMO_SETTING")}
+    os.environ.update({"PYTHONPATH": "/some/dev/folder", "PYTHONSTARTUP": "/some/startup.py", "PYTHONINSPECT": "1", "PHYLAX_DEMO_SETTING": "kept"})
+    try:
+        subprocess.run = spy
+        assert analyzer.analyze("x = 1\n", "python").ok
+        assert seen["stdin"] is subprocess.DEVNULL, "the child never inherits the service's input"
+        for name in ("PYTHONPATH", "PYTHONSTARTUP", "PYTHONINSPECT"):
+            assert name not in seen["env"], f"{name} must not reach the child"
+        assert seen["env"]["PYTHONUTF8"] == "1" and seen["env"]["PHYLAX_DEMO_SETTING"] == "kept", "everything else is kept"
+        assert seen["timeout"] == BANDIT_TIMEOUT_SECONDS and Path(seen["cwd"]).name.startswith("flwn_scan_") and seen["cmd"][1:3] == ["-m", "bandit"]
+        assert child_environment().get("PATH") == os.environ.get("PATH"), "PATH and the rest of the system's settings are untouched"
+
+        def stalled(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, 30, output=b"partial\nout", stderr=b"Traceback: it\nwas waiting " + b"x" * 400)
+
+        subprocess.run = stalled
+        result = analyzer.analyze("x = 1\n", "python")
+        assert not result.ok and "bandit timed out after 30s (it printed: Traceback: it was waiting xxxx" in result.error and "partial out" in result.error
+        assert "\n" not in result.error and len(result.error) < 450, "the explanation is one short line"
+
+        def silent(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, 30)
+
+        subprocess.run = silent
+        assert analyzer.analyze("x = 1\n", "python").error.endswith("(it printed nothing before it was stopped)")
+    finally:
+        subprocess.run = real_run
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    # the REAL Bandit, with the developer settings present in the environment, still runs and still finds the problem
+    os.environ.update({"PYTHONPATH": tempfile.gettempdir(), "PYTHONINSPECT": "1"})
+    try:
+        real = analyzer.analyze("import os\n\ndef ping(host):\n    os.system('ping ' + host)\n", "python")
+        assert real.ok and [f.vulnerability_type for f in real.findings] == ["command_injection"], real.error
+        assert analyzer.analyze("x = 1\n", "javascript").ok is False
+    finally:
+        for name in ("PYTHONPATH", "PYTHONINSPECT"):
+            if saved[name] is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = saved[name]
+    print("adapters.bandit OK: the child never inherits the service's input or its developer settings, a stall says what Bandit printed, the real Bandit still finds the problem")
+
+
+if __name__ == "__main__":
+    demo()

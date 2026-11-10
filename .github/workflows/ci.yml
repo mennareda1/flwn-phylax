@@ -1,0 +1,38 @@
+# Runs every check on each push to main and on each pull request: the Python suite (rules, service, contract, benchmarks) and the TypeScript client's tests.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: constraints-runtime.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # The exact versions the service is deployed with, plus the tools the tests need.
+      - name: Install Python packages
+        run: pip install -r requirements-runtime.txt -c constraints-runtime.txt pyyaml jsonschema openapi-spec-validator httpx
+
+      - name: Install the TypeScript client's packages
+        run: npm ci
+        working-directory: clients/typescript
+
+      - name: Run every check
+        run: python -m tests.run_all
