@@ -15,6 +15,7 @@ import { DiskFileChanger } from '../src/adapters/disk.js';
 import { HttpPhylaxApi, type PhylaxApi } from '../src/api.js';
 import { PhylaxApiError } from '../src/errors.js';
 import { SecurityReview } from '../src/review.js';
+import { createSecurityTools, type SecurityTool } from '../src/tools.js';
 import { ScriptedPerson, tempProject } from './helpers.js';
 
 const REPO_ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
@@ -195,4 +196,47 @@ test('declining, or choosing nothing, changes nothing and asks for no correction
     assert.equal(await readFile(path.join(project.root, 'run.js'), 'utf8'), RUN);
     assert.equal(await readFile(path.join(project.root, 'db.ts'), 'utf8'), DB);
   } finally { await project.cleanup(); }
+});
+
+test('the three tools, driven the way a model would drive them: scan, pick, propose, apply, against the real service', { timeout: 90_000 }, async (t) => {
+  if (!service) return t.skip(skipReason ?? 'no service');
+  const changes = (await import(pathToFileURL(FIXTURE).href)) as OqeliraChangesModule;
+  for (const host of ['a plain folder', "Oqelira's change mechanism"]) {
+    const project = await tempProject({ 'run.js': crlf(RUN), 'db.ts': DB, 'token.js': TOKEN, 'ok.js': CLEAN });
+    try {
+      const shown: string[] = [];
+      const pack = createSecurityTools({
+        phylax: api(),
+        files: (ctx) => (host === 'a plain folder' ? new DiskFileChanger(ctx.cwd) : new OqeliraFileChanger({ cwd: ctx.cwd, changes })),
+        consent: { kind: 'callback', confirm: async (proposal) => { shown.push(proposal.diff); return true; } },
+      });
+      const [scan, propose, apply] = pack.tools as [SecurityTool, SecurityTool, SecurityTool];
+      const context = { cwd: project.root };
+
+      const scanned = JSON.parse((await scan.execute({}, context)).content);
+      assert.equal(scanned.decision, 'block', host);
+      const offered = scanned.findings.filter((f: { correction: { offered: boolean } }) => f.correction.offered);
+      assert.deepEqual(offered.map((f: { where: string }) => f.where.split(':')[0]), ['run.js', 'db.ts'], `${host}: high and medium are offered`);
+      const reportOnly = scanned.findings.filter((f: { correction: { offered: boolean } }) => !f.correction.offered);
+      assert.deepEqual(reportOnly.map((f: { where: string }) => f.where.split(':')[0]), ['token.js'], `${host}: the low finding is reported only`);
+
+      const proposals = JSON.parse((await propose.execute({ finding_keys: offered.map((f: { key: string }) => f.key) }, context)).content);
+      assert.equal(proposals.proposals.length, 2, host);
+      assert.equal(JSON.stringify(proposals).includes('corrected_content'), false);
+      assert.equal(await readFile(path.join(project.root, 'run.js'), 'utf8'), crlf(RUN), 'proposing changes nothing');
+
+      for (const proposal of proposals.proposals) {
+        const applied = JSON.parse((await apply.execute({ proposal_id: proposal.proposal_id }, context)).content);
+        assert.equal(applied.applied, true, `${host}: ${proposal.path}`);
+        assert.equal(applied.verification.outcome, 'passed');
+      }
+      assert.equal(shown.length, 2, 'the person was shown both diffs');
+      assert.equal(await readFile(path.join(project.root, 'run.js'), 'utf8'), crlf(RUN_FIXED), `${host}: the Windows file is corrected and is still a Windows file`);
+      assert.equal(await readFile(path.join(project.root, 'db.ts'), 'utf8'), DB_FIXED);
+      assert.equal(await readFile(path.join(project.root, 'token.js'), 'utf8'), TOKEN);
+      await pack.close();
+      const gone: Response = await fetch(`${service.url}/v1/scans/${scanned.findings[0].key.split(':')[0]}`, { headers: { Authorization: `Bearer ${service.key}` } });
+      assert.equal(gone.status, 404, 'closing removed the scan from the service');
+    } finally { await project.cleanup(); }
+  }
 });
