@@ -193,7 +193,7 @@ def run() -> None:
         assert r.headers["www-authenticate"] == "Bearer" and r.json()["code"] == "unauthorized"
         caps = call(client, "GET", "/v1/capabilities", expect=200, key=KEY_BOB).json()                     # any valid key, even read-only
         assert caps["features"] == {"fixes": False, "verifications": True} and caps["limits"]["max_files"] == 5 and caps["limits"]["max_wait_seconds"] == 10
-        assert caps["contract_version"] == spec["info"]["version"] == "1.1.0"
+        assert caps["contract_version"] == spec["info"]["version"] == "1.3.0"
 
         # ---------------------------------------------------------------- authentication, scopes, and the order of the checks
         for label, headers in (("a wrong key", auth("wrong-key-wrong-key-wrong-key-1")), ("no key", {}), ("basic auth", {"Authorization": f"Basic {KEY_ALICE}"}),
@@ -478,6 +478,12 @@ def run() -> None:
         assert fix["verification"]["outcome"] == "passed" and fix["verification"]["resolved_finding_ids"] == ["f1"] and fix["verification"]["scan_id"] == sid
         assert [c["name"] for c in fix["verification"]["checks"]] == ["scope", "syntax", "patch_size", "rescan"]
         patched = apply_unified_diff(BAD_CODE, fix["patches"][0]["unified_diff"], "bad.py")
+        # the exact-apply fields: the hash of what was scanned (also in the scan's coverage), the whole corrected file, and its hash
+        import hashlib
+        sha = lambda text: hashlib.sha256(text.encode("utf-8")).hexdigest()
+        scan_hashes = {f["path"]: f["sha256"] for f in call(client, "GET", "/v1/scans/{scan_id}", f"/v1/scans/{sid}", 200, key=KEY_ALICE).json()["report"]["coverage"]["scanned_files"]}
+        assert fix["patches"][0]["base_sha256"] == scan_hashes["bad.py"] == sha(BAD_CODE)
+        assert fix["patches"][0]["corrected_content"] == patched and fix["patches"][0]["corrected_sha256"] == sha(patched)
         assert "subprocess.run" in patched and "os.system" not in patched and fix["patches"][0]["finding_ids"] == ["f1"] and fixer.calls == 1
         assert call(client, "GET", FIX, f"/v1/fixes/{fix['id']}", 200, key=KEY_ALICE).json() == fix
         assert call(client, "GET", VER, f"/v1/verifications/{fix['verification']['id']}", 200, key=KEY_ALICE).json() == fix["verification"]
@@ -614,6 +620,36 @@ def run() -> None:
         now[0] += 3601                                                                                                      # the scan's retention ends, and its fixes with it
         call(client, "GET", FIX, f"/v1/fixes/{crashed['id']}", 404, key=KEY_ALICE)
         assert store.child_count() == 0
+    finally:
+        gateway.shutdown()
+
+    # ---------------------------------------------------------------- JavaScript and TypeScript through the HTTP service
+    js_svc = ScanService(limits=LIMITS)
+    app, gateway, store = build(service=js_svc)
+    client = TestClient(app, raise_server_exceptions=False)
+    try:
+        caps = call(client, "GET", "/v1/capabilities", expect=200, key=KEY_ALICE).json()
+        assert {"id": "javascript", "roles": ["analyzer"]} in caps["languages"] and {"id": "typescript", "roles": ["analyzer"]} in caps["languages"] and {"id": "python", "roles": ["analyzer"]} in caps["languages"]
+        wait = {"Prefer": "wait=20"}
+        js_code = 'const { exec } = require("child_process");\n// ' + CANARY + '\nfunction run(dir) {\n  exec(`ls ${dir}`);\n}\n'
+        scan = call(client, "POST", "/v1/scans", expect=200, key=KEY_ALICE, headers=wait, body={"files": [{"path": "src/run.js", "content": js_code}]}).json()
+        assert scan["report"]["decision"] == "block" and scan["report"]["findings"][0]["rule_id"] == "JS-EXEC" and scan["report"]["findings"][0]["path"] == "src/run.js"
+        assert scan["report"]["coverage"]["languages"] == ["javascript"] and "jsrules" in scan["report"]["coverage"]["analyzers_run"]
+        ts = call(client, "POST", "/v1/scans", expect=200, key=KEY_ALICE, headers=wait,
+                  body={"files": [{"path": "src/db.ts", "content": "export const find = (id: string) => pool.query(`SELECT * FROM t WHERE id = ${id}`);\n"}]}).json()
+        assert ts["report"]["decision"] == "review_required" and ts["report"]["findings"][0]["rule_id"] == "JS-SQL"
+        mixed = call(client, "POST", "/v1/scans", expect=200, key=KEY_ALICE, headers=wait,
+                     body={"files": [{"path": "a.py", "content": "x = 1\n"}, {"path": "b.js", "content": "const a = 1;\n"}, {"path": "c.tsx", "content": "export const C = () => <div />;\n"}, {"path": "d.go", "content": "package main\n"}]}).json()
+        assert mixed["report"]["coverage"]["languages"] == ["javascript", "python", "typescript"] and [s["path"] for s in mixed["report"]["coverage"]["skipped_files"]] == ["d.go"]
+        broken = call(client, "POST", "/v1/scans", expect=200, key=KEY_ALICE, headers=wait, body={"files": [{"path": "bad.js", "content": "function ( {" + CANARY}]}).json()
+        assert broken["report"]["decision"] == "scan_failed" and CANARY not in json.dumps(broken)                    # a file that does not parse is a failed engine, and its text is not echoed
+        # a correction of the JavaScript file, checked by the verification endpoint
+        fixed_js = js_code.replace('const { exec }', 'const { execFile }').replace("exec(`ls ${dir}`);", 'execFile("ls", [dir]);')
+        verified = call(client, "POST", "/v1/verifications", expect=200, key=KEY_ALICE, headers=wait, body={"scan_id": scan["id"], "files": [{"path": "src/run.js", "content": fixed_js}]}).json()
+        assert verified["outcome"] == "passed" and verified["resolved_finding_ids"] == ["f1"]
+        assert "JavaScript/TypeScript file(s) parse; undefined names are not checked" in next(c["detail"] for c in verified["checks"] if c["name"] == "syntax")
+        unparsable = call(client, "POST", "/v1/verifications", expect=200, key=KEY_ALICE, headers=wait, body={"scan_id": scan["id"], "files": [{"path": "src/run.js", "content": fixed_js.replace("[dir]", "[dir")}]}).json()
+        assert unparsable["outcome"] == "failed" and next(c for c in unparsable["checks"] if c["name"] == "syntax")["result"] == "fail"
     finally:
         gateway.shutdown()
 

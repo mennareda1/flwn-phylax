@@ -7,9 +7,11 @@ script): the same checks apply to all.
 
 The four checks of the contract (openapi.yaml, VerificationCheck):
   scope       only files that were in the scan changed, and something did change.
-  syntax      every changed Python file parses, and the change introduced no UNDEFINED NAME. The second half matters: deleting an
-              import that other code still uses parses fine and passes a re-scan, then crashes when it runs. Names that were already
-              undefined before the change are not blamed on it. A file with `from x import *` cannot be judged this way and says so.
+  syntax      every changed Python, JavaScript and TypeScript file parses, and for PYTHON the change introduced no UNDEFINED NAME. The
+              second half matters: deleting an import that other code still uses parses fine and passes a re-scan, then crashes when it
+              runs. Names that were already undefined before the change are not blamed on it. A Python file with `from x import *` cannot
+              be judged this way and says so. For JavaScript and TypeScript the undefined-name check is NOT done yet (it needs scope
+              analysis), and the check's detail says so: run the project's build or tests after applying.
   patch_size  added plus removed lines, over all files, within the limit.
   rescan      the changed files are scanned again with the same engines. Every requested finding must be gone (counted per file and
               problem type, because lines shift), and nothing NEW may appear that a rule backs at medium severity or above. A new
@@ -28,7 +30,8 @@ import symtable
 from dataclasses import dataclass, replace
 from typing import Iterable
 
-from security_service.core.files import SourceFile
+from security_service.adapters.js_rules import available as js_available, check_syntax as js_syntax
+from security_service.core.files import EXTENSION_LANGUAGES, SourceFile, normalize_newlines
 from security_service.core.patching import changed_line_count, make_unified_diff
 from security_service.core.schema import EvidenceTier, Finding, Severity
 
@@ -105,8 +108,12 @@ def _key(finding: Finding) -> tuple[str, str]:
     return (_norm(finding.path or ""), finding.vulnerability_type)
 
 
-def _is_python(path: str) -> bool:
-    return path.lower().endswith((".py", ".pyi", ".pyw"))
+def _language(path: str) -> str | None:
+    lowered = path.lower()
+    if lowered.endswith(".pyw"):
+        return "python"
+    dot = lowered.rfind(".")
+    return EXTENSION_LANGUAGES.get(lowered[dot:]) if dot != -1 else None
 
 
 class VerificationService:
@@ -138,11 +145,22 @@ class VerificationService:
         checks = [scope]
 
         # ---- syntax: parses, and no new undefined names
-        python = [c for c in changed if _is_python(c.path)]
-        if not python:
-            checks.append(Check("syntax", "skipped", "No changed file is Python, so there is nothing to parse."))
+        python = [c for c in changed if _language(c.path) == "python"]
+        web = [(c, _language(c.path)) for c in changed if _language(c.path) in ("javascript", "typescript")]
+        if not python and not web:
+            checks.append(Check("syntax", "skipped", "No changed file is Python, JavaScript or TypeScript, so there is nothing to parse."))
         else:
             problems, notes = [], []
+            parsed_web = 0
+            for c, language in web:
+                if not js_available():
+                    notes.append(f"{c.path} was not parsed: the JavaScript parser is not installed")
+                    continue
+                message = js_syntax(c.content, language)
+                if message:
+                    problems.append(f"{c.path} does not parse ({message})")
+                else:
+                    parsed_web += 1
             for c in python:
                 try:
                     ast.parse(c.content)
@@ -157,10 +175,15 @@ class VerificationService:
             if problems:
                 checks.append(Check("syntax", "fail", "; ".join(problems) + "."))
             else:
-                checks.append(Check("syntax", "pass", f"{len(python)} changed Python file(s) parse and use no new undefined name" + (f" ({'; '.join(notes)})." if notes else ".")))
+                parts = []
+                if python:
+                    parts.append(f"{len(python)} changed Python file(s) parse and use no new undefined name")
+                if parsed_web:
+                    parts.append(f"{parsed_web} changed JavaScript/TypeScript file(s) parse; undefined names are not checked for them yet")
+                checks.append(Check("syntax", "pass", "; ".join(parts) + (f" ({'; '.join(notes)})." if notes else ".")))
 
         # ---- patch size
-        lines = sum(changed_line_count(make_unified_diff(c.path, before_files[c.path].content, c.content)) for c in changed)
+        lines = sum(changed_line_count(make_unified_diff(c.path, normalize_newlines(before_files[c.path].content), normalize_newlines(c.content))) for c in changed)      # line endings alone are not a change
         checks.append(Check("patch_size", "pass" if lines <= limit else "fail", f"{lines} changed line(s), limit {limit}."))
 
         # ---- rescan: requested findings gone, nothing new that a rule backs
@@ -367,6 +390,32 @@ def demo() -> None:
     # backslashes and ./ in paths are the same file
     same = verifier.verify([SourceFile("net.py", original)], [SourceFile(".\\net.py", good)], baseline)
     assert same.outcome == "passed"
+
+    # ---------------------------------------------------------------- JavaScript and TypeScript, with the real engines
+    real = VerificationService(ScanService())
+    js_before = 'const { exec } = require("child_process");\n\nfunction run(dir) {\n  exec(`ls ${dir}`);\n}\n'
+    js_base = ScanService().scan([SourceFile("run.js", js_before)]).findings
+    assert [(f.id, f.rule_id) for f in js_base] == [("f1", "JS-EXEC")]
+    js_good = js_before.replace('const { exec }', 'const { execFile }').replace("exec(`ls ${dir}`);", 'execFile("ls", [dir]);')
+    js_ok = real.verify([SourceFile("run.js", js_before)], [SourceFile("run.js", js_good)], js_base)
+    assert js_ok.outcome == "passed" and js_ok.resolved_finding_ids == ("f1",) and status(js_ok) == {"scope": "pass", "syntax": "pass", "patch_size": "pass", "rescan": "pass"}
+    assert "JavaScript/TypeScript file(s) parse; undefined names are not checked for them yet" in next(c.detail for c in js_ok.checks if c.name == "syntax")      # the limitation is stated, not hidden
+    js_broken = real.verify([SourceFile("run.js", js_before)], [SourceFile("run.js", js_good.replace('[dir]);', '[dir);'))], js_base)
+    failed(js_broken, "syntax", "run.js does not parse (syntax error near line")
+    js_swapped = real.verify([SourceFile("run.js", js_before)], [SourceFile("run.js", js_before.replace("exec(`ls ${dir}`);", "eval(dir);"))], js_base)
+    failed(js_swapped, "rescan", "1 new finding(s)")
+    assert [f.rule_id for f in js_swapped.new_findings] == ["JS-EVAL"]
+    js_same = real.verify([SourceFile("run.js", js_before)], [SourceFile("run.js", js_before + "// comment\n")], js_base)
+    failed(js_same, "rescan", "f1 (command_injection in run.js; still flagged at line 4 by JS-EXEC)")
+    ts_before = "export function find(id: string) {\n  return pool.query(`SELECT * FROM t WHERE id = ${id}`);\n}\n"
+    ts_base = ScanService().scan([SourceFile("src/db.ts", ts_before)]).findings
+    ts_good = ts_before.replace("pool.query(`SELECT * FROM t WHERE id = ${id}`)", 'pool.query("SELECT * FROM t WHERE id = $1", [id])')
+    ts_ok = real.verify([SourceFile("src/db.ts", ts_before)], [SourceFile("src/db.ts", ts_good)], ts_base)
+    assert ts_ok.outcome == "passed" and ts_ok.resolved_finding_ids == ("f1",)
+    mixed_ok = real.verify([SourceFile("run.js", js_before), SourceFile("a.py", "import os\n\nx = os.getcwd()\n")], [SourceFile("run.js", js_good), SourceFile("a.py", "import os\n\nx = os.getcwd()  # note\n")], js_base)
+    detail = next(c.detail for c in mixed_ok.checks if c.name == "syntax")
+    assert mixed_ok.outcome == "passed" and "1 changed Python file(s) parse and use no new undefined name; 1 changed JavaScript/TypeScript file(s) parse" in detail
+    assert status(real.verify([SourceFile("n.go", "package main\n")], [SourceFile("n.go", "package main\n// x\n")], [])) ["syntax"] == "skipped"       # a language with nothing to parse is skipped, and says so
 
     print("core.verification OK: scope, syntax with undefined names, patch size, rescan; failed vs inconclusive vs passed; model-only noise listed but not failing")
 

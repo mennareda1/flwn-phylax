@@ -54,7 +54,10 @@ def _strongest_kind(hits: list[SecretHit]) -> str:
 class SecretsAnalyzer:
     role = "analyzer"
     name = "secrets"
-    languages = ("python",)
+
+    def __init__(self, languages: tuple[str, ...] = ("python",)):
+        """The languages it covers. Widen this only together with a rules engine for the same language (see the module note)."""
+        self.languages = languages
 
     def analyze(self, code: str, language: str) -> AnalyzerResult:
         started = time.monotonic()

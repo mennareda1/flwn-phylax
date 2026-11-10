@@ -10,6 +10,10 @@ role in the scanner. Run from the repo root:
     python -m benchmark.classifier_eval --no-injection skip the "approved by security" test (about half the requests)
     python -m benchmark.classifier_eval --selftest     checks this program itself, offline
 
+Add `--language javascript` to any of the runs above to judge Decision-1 on JavaScript and TypeScript instead of Python. It uses the JavaScript
+questions, benchmark/cases_javascript.py for development runs and benchmark/cases_heldout_js.py (also locked by a fingerprint) for the final
+one, and writes classifier_eval_javascript_report.txt so the Python result is never overwritten. The gate is the same four-part gate.
+
 It writes classifier_eval_report.txt (the readable result) and classifier_eval_results.json (every number).
 Each case is ONE request carrying all the security questions (one yes/no per vulnerability category; there is no
 question about secrets, which the deterministic secrets check owns, so VULNERABLE cases about secrets are left out;
@@ -41,9 +45,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from benchmark import cases_heldout
+from benchmark import cases_heldout, cases_heldout_js
+from benchmark.cases_javascript import CASES as JS_CASES
 from benchmark.cases_python import CASES
 from benchmark.run_benchmark import run as run_rules
+from security_service.adapters.js_rules import available as js_available
 from security_service.config import Settings, load_env_file
 from security_service.core.questions import CATEGORY_IDS, VERDICT_ID, build_questions
 from security_service.core.scan_service import ScanService
@@ -71,6 +77,18 @@ ABBREV = {
 }
 REPORT_FILE = "classifier_eval_report.txt"
 RESULTS_FILE = "classifier_eval_results.json"
+
+# What each language is judged on. Python is the original suite; JavaScript (which covers TypeScript) was added with its own cases, questions and lock.
+SUITES = {
+    "python": {"title": "Python", "dev": lambda: CASES, "heldout": cases_heldout, "rules": "Bandit plus the secrets check", "suffix": ""},
+    "javascript": {"title": "JavaScript and TypeScript", "dev": lambda: JS_CASES, "heldout": cases_heldout_js, "rules": "our JavaScript rules plus the secrets check",
+                   "suffix": "_javascript"},
+}
+
+
+def output_files(language: str) -> tuple[str, str]:
+    suffix = SUITES[language]["suffix"]
+    return REPORT_FILE.replace("_report", f"{suffix}_report"), RESULTS_FILE.replace("_results", f"{suffix}_results")
 PRICE_PER_MILLION_INPUT_TOKENS = 0.042      # Microsoft's published price for Decision-1 input; output is free
 
 
@@ -78,11 +96,12 @@ class HeldOutChanged(RuntimeError):
     """The held-out cases no longer match the fingerprint pinned when they were written."""
 
 
-def check_heldout_intact() -> str:
+def check_heldout_intact(language: str = "python") -> str:
     """Refuse to produce a final verdict on a held-out set that was edited after it was written."""
-    actual = cases_heldout.fingerprint()
-    if actual != cases_heldout.PINNED_FINGERPRINT:
-        raise HeldOutChanged(f"the held-out cases changed (fingerprint {actual}, pinned {cases_heldout.PINNED_FINGERPRINT}): "
+    module = SUITES[language]["heldout"]
+    actual = module.fingerprint()
+    if actual != module.PINNED_FINGERPRINT:
+        raise HeldOutChanged(f"the held-out cases changed (fingerprint {actual}, pinned {module.PINNED_FINGERPRINT}): "
                              "they are no longer held out, so no final verdict can be given on them")
     return actual
 
@@ -285,6 +304,7 @@ def build_report(result: dict, verdict: dict, probes: list[Probe], rules_rows: l
     heldout = meta.get("mode") == "heldout"
     add(f"CLASSIFIER EVALUATION: {meta['label']}")
     add("=" * 78)
+    add(f"language: {SUITES[meta.get('language', 'python')]['title']}")
     add("HELD-OUT RUN: the final verdict, on cases no model had seen" if heldout else
         "DEVELOPMENT RUN: every number, but not a final verdict (the verdict that counts is --heldout)")
     if heldout:
@@ -301,7 +321,7 @@ def build_report(result: dict, verdict: dict, probes: list[Probe], rules_rows: l
     add("worth keeping, not how accurate the model is in general.")
     add("")
 
-    add("RULES ALONE (Bandit plus the secrets check), on the same cases")
+    add(f"RULES ALONE ({SUITES[meta.get('language', 'python')]['rules']}), on the same cases")
     add(f"  alarmed on {result['rules']['alarmed_vulnerable']} of {cases['vulnerable']} vulnerable cases; false alarms on {result['rules']['false_alarms']} of {cases['safe']} safe cases")
     add("")
 
@@ -421,8 +441,8 @@ def _number_after(argv: list[str], flag: str, cast, default):
 
 
 def run_evaluation(classifier, cases: list[dict], variants: dict[str, str], label: str, log=print, pause: float = 0.0,
-                   smoke: bool = False, heldout: bool = False, excluded: int = 0):
-    questions = build_questions()
+                   smoke: bool = False, heldout: bool = False, excluded: int = 0, language: str = "python"):
+    questions = build_questions(language=language)
     rules_rows = run_rules(ScanService(), cases)
     probes = evaluate(classifier, cases, variants, questions, pause=pause, log=log)
     result = analyze(probes, rules_rows)
@@ -431,7 +451,8 @@ def run_evaluation(classifier, cases: list[dict], variants: dict[str, str], labe
     meta = {"label": label, "mode": "heldout" if heldout else "development", "questions": len(questions),
             "calls": sum(p.calls for p in probes), "tokens": sum(p.tokens for p in probes),
             "avg_seconds": (sum(timed) / len(timed)) if timed else 0.0, "max_seconds": max(timed) if timed else 0.0,
-            "smoke_test": smoke, "excluded": excluded, "fingerprint": cases_heldout.fingerprint() if heldout else None}
+            "smoke_test": smoke, "excluded": excluded, "language": language,
+            "fingerprint": SUITES[language]["heldout"].fingerprint() if heldout else None}
     return build_report(result, verdict, probes, rules_rows, meta), to_json(result, verdict, probes, meta), verdict
 
 
@@ -440,6 +461,16 @@ def main(argv: list[str]) -> int:
         selftest()
         return 0
     heldout = "--heldout" in argv
+    language = argv[argv.index("--language") + 1].lower() if "--language" in argv and argv.index("--language") + 1 < len(argv) else "python"
+    if language == "typescript":
+        language = "javascript"                                          # TypeScript is judged together with JavaScript
+    if language not in SUITES:
+        print(f"Refused: --language must be one of {', '.join(SUITES)} (got {language!r}). TypeScript is judged together with JavaScript.")
+        return 2
+    if language == "javascript" and not js_available():
+        print("Refused: judging JavaScript needs the parser packages, and they are not installed. Install them once, then run this again:\n\n"
+              "    pip install -r requirements.txt")
+        return 2
     limit = _number_after(argv, "--limit", int, 0)
     if heldout and limit:
         print("Refused: --limit cannot be combined with --heldout. A partial held-out run would show you results without a\n"
@@ -447,7 +478,7 @@ def main(argv: list[str]) -> int:
         return 2
     if heldout:
         try:
-            check_heldout_intact()
+            check_heldout_intact(language)
         except HeldOutChanged as problem:
             print(f"Refused: {problem}")
             return 2
@@ -459,15 +490,15 @@ def main(argv: list[str]) -> int:
     if problems:
         print("Cannot start:\n" + "\n".join(f"  - {p}" for p in problems) + "\nRun `python -m security_service.config` to see your settings.")
         return 2
-    source = list(cases_heldout.HELDOUT_CASES) if heldout else list(CASES)
+    source = list(SUITES[language]["heldout"].HELDOUT_CASES) if heldout else list(SUITES[language]["dev"]())
     cases, excluded = askable(source)
     if limit:
         cases = smoke_sample(cases, limit)
     variants = {} if "--no-injection" in argv else INJECTIONS
     classifier = Decision1Classifier.from_settings(settings)
     requests = len(cases) + len(variants) * sum(c["kind"] == "vulnerable" for c in cases)
-    per_request = sum(len(q.instructions) + sum(len(v) for v in (q.options or {}).values()) for q in build_questions()) // 4 + 150
-    print(f"{'HELD-OUT' if heldout else 'Development'} run: {len(cases)} cases with {settings.decision1_url}")
+    per_request = sum(len(q.instructions) + sum(len(v) for v in (q.options or {}).values()) for q in build_questions(language=language)) // 4 + 150
+    print(f"{'HELD-OUT' if heldout else 'Development'} run, {SUITES[language]['title']}: {len(cases)} cases with {settings.decision1_url}")
     if heldout:
         print("This is the FINAL test. Run it once. Whatever it says is the answer: do not reword the questions and run it again.")
     print(f"About {requests} requests, roughly {requests * per_request} input tokens, about ${requests * per_request * PRICE_PER_MILLION_INPUT_TOKENS / 1e6:.3f} at Microsoft's price.")
@@ -475,14 +506,15 @@ def main(argv: list[str]) -> int:
              + ("  [SMOKE TEST]" if limit else ""))
     try:
         lines, data, verdict = run_evaluation(classifier, cases, variants, label, pause=_number_after(argv, "--pause", float, 0.0),
-                                              smoke=bool(limit), heldout=heldout, excluded=excluded)
+                                              smoke=bool(limit), heldout=heldout, excluded=excluded, language=language)
     except EvaluationAborted as stop:
         print(f"\nStopped: {stop}\nRun `python -m security_service.config` and `python -m tests.live_decision1` to find the cause.")
         return 1
-    Path(REPORT_FILE).write_text("\n".join(lines) + "\n", encoding="utf-8")
-    Path(RESULTS_FILE).write_text(json.dumps(data, indent=2), encoding="utf-8")
+    report_file, results_file = output_files(language)
+    Path(report_file).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    Path(results_file).write_text(json.dumps(data, indent=2), encoding="utf-8")
     print("\n" + "\n".join(lines))
-    print(f"\nSaved {REPORT_FILE} and {RESULTS_FILE}. Paste the contents of {REPORT_FILE} (it contains no key) to share the result.")
+    print(f"\nSaved {report_file} and {results_file}. Paste the contents of {report_file} (it contains no key) to share the result.")
     return 0
 
 
@@ -500,7 +532,7 @@ class _Model:
         self.name = f"scripted-{behaviour}"
         self.behaviour, self.reject_over, self.fail_ids, self.auth_failure = behaviour, reject_over, fail_ids, auth_failure
         self.miss_ids, self.noisy_ids = miss_ids, noisy_ids
-        self.by_code = {c["code"]: c for c in [*CASES, *cases_heldout.HELDOUT_CASES]}
+        self.by_code = {c["code"]: c for c in [*CASES, *cases_heldout.HELDOUT_CASES, *JS_CASES, *cases_heldout_js.HELDOUT_CASES]}
         self.requests = 0
 
     def classify(self, state: str, questions: list[Question]) -> ClassifierResult:
@@ -652,6 +684,102 @@ def selftest() -> None:
     assert dev_final["final"] is False and "FINAL" not in dev_text.replace("final verdict", "").replace("final", "")
     _, _, smoke_final = run_evaluation(_Model("oracle"), held[:6], INJECTIONS, "scripted", log=quiet, heldout=True, smoke=True)
     assert smoke_final["final"] is False                                    # a partial run can never be final
+
+    # --- without the parser packages, judging JavaScript is refused with a clear instruction (the rules could not scan a single case)
+    this_module = sys.modules[__name__]                     # the module that is running (run as a script it is __main__, not benchmark.classifier_eval)
+
+    real_available = this_module.js_available
+    this_module.js_available = lambda: False
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            assert main(["--language", "javascript"]) == 2 and main(["--language", "typescript", "--heldout"]) == 2
+        assert "pip install -r requirements.txt" in printed.getvalue() and "parser packages" in printed.getvalue()
+    finally:
+        this_module.js_available = real_available
+
+    # --- the same program judging JavaScript and TypeScript: its own cases, questions, lock and files; Python's are untouched
+    dev_js, js_left_out = askable(JS_CASES)
+    held_js, js_held_left_out = askable(cases_heldout_js.HELDOUT_CASES)
+    assert js_left_out == 0 and js_held_left_out == 0 and len(dev_js) == len(JS_CASES) == 51 and len(held_js) == 39
+    js_questions = build_questions(language="javascript")
+    assert [q.id for q in js_questions] == list(CATEGORY_IDS) and js_questions[0].instructions != build_questions()[0].instructions
+    rules_js_held = run_rules(ScanService(), held_js)
+    js_missed = sum(not r["alarmed"] for r in rules_js_held if r["case"]["kind"] == "vulnerable")
+    assert js_missed == 9 and not any(r["decision"].value == "scan_failed" for r in rules_js_held)
+
+    def run_js(model, variants=INJECTIONS, final=False):
+        probes = evaluate(model, held_js, variants, js_questions, log=quiet)
+        result = analyze(probes, rules_js_held)
+        return probes, result, gate(result, final=final)
+
+    js_oracle = _Model("oracle")
+    js_probes, js_result, js_verdict = run_js(js_oracle, final=True)
+    assert js_result["by_threshold"][0.7]["classifier_found"] == 14 and js_result["by_threshold"][0.7]["extra_found"] == js_missed == 9
+    assert js_verdict["verdict"] == "PASS" and js_verdict["final"] is True and js_oracle.requests == 39 + len(INJECTIONS) * 14
+    assert all(set(p.answers) == set(CATEGORY_IDS) for p in js_probes)
+    assert run_js(_Model("gullible"))[2]["checks"] == {"recall": True, "adds": True, "false_alarms": True, "injection": False}
+    assert run_js(_Model("trigger_happy"))[2]["checks"]["false_alarms"] is False
+    assert run_js(_Model("wrong_category"))[2]["verdict"] == "FAIL"
+    assert run_js(_Model("oracle"), variants={})[2]["verdict"] == "NOT DECIDED"
+    js_quiet_safe = [r["case"]["id"] for r in rules_js_held if r["case"]["kind"] != "vulnerable" and not r["alarmed"]]
+    js_caught_by_rules = [r["case"]["id"] for r in rules_js_held if r["case"]["kind"] == "vulnerable" and r["alarmed"]]
+    for count, expected in ((2, "PASS"), (3, "FAIL")):
+        assert run_js(_Model("oracle", noisy_ids=tuple(js_quiet_safe[:count])))[2]["verdict"] == expected, ("extra false alarms", count)
+    for count, expected in ((2, "PASS"), (3, "FAIL")):                      # 12 of 14 passes the 80% bar; 11 of 14 does not
+        assert run_js(_Model("oracle", miss_ids=tuple(js_caught_by_rules[:count])))[2]["verdict"] == expected, ("misses", count)
+
+    # the lock on the JavaScript held-out set, separate from Python's
+    real_js_pin = cases_heldout_js.PINNED_FINGERPRINT
+    cases_heldout_js.PINNED_FINGERPRINT = "000000000000"
+    try:
+        try:
+            check_heldout_intact("javascript")
+            raise AssertionError("an edited JavaScript held-out set must be refused")
+        except HeldOutChanged:
+            pass
+        assert check_heldout_intact("python") == real_pin                  # Python's lock is its own
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            assert main(["--language", "javascript", "--heldout"]) == 2 and main(["--language", "typescript", "--heldout"]) == 2
+        assert "changed" in printed.getvalue() and "no final verdict" in printed.getvalue()
+    finally:
+        cases_heldout_js.PINNED_FINGERPRINT = real_js_pin
+    assert check_heldout_intact("javascript") == real_js_pin
+    with contextlib.redirect_stdout(io.StringIO()) as printed:
+        assert main(["--language", "javascript", "--heldout", "--limit", "3"]) == 2 and "peeking" in printed.getvalue()
+        assert main(["--language", "cobol"]) == 2 and "must be one of python, javascript" in printed.getvalue()
+    with contextlib.redirect_stdout(io.StringIO()) as printed:                                 # TypeScript is ACCEPTED as a language (it reaches the no-peeking rule), not refused as unknown
+        assert main(["--language", "typescript", "--heldout", "--limit", "3"]) == 2
+    assert "peeking" in printed.getvalue() and "must be one of" not in printed.getvalue()
+    assert output_files("python") == ("classifier_eval_report.txt", "classifier_eval_results.json")
+    assert output_files("javascript") == ("classifier_eval_javascript_report.txt", "classifier_eval_javascript_results.json")
+
+    js_lines, js_data, js_final = run_evaluation(_Model("oracle"), held_js, INJECTIONS, "scripted", log=quiet, heldout=True, language="javascript")
+    js_text = "\n".join(js_lines)
+    for heading in ("language: JavaScript and TypeScript", "RULES ALONE (our JavaScript rules plus the secrets check)", f"fingerprint {cases_heldout_js.fingerprint()}",
+                    "VERDICT (FINAL, held-out set): PASS", "HELD-OUT RUN: the final verdict"):
+        assert heading in js_text, heading
+    assert js_text.isascii() and all(case["id"] in js_text for case in held_js) and js_data["meta"]["language"] == "javascript" and js_data["meta"]["questions"] == 12
+    assert js_final["final"] is True and "Bandit" not in js_text
+    class _Recorder(_Model):
+        """Remembers the questions it was sent, so the wording that actually goes out can be checked (the plain oracle answers by id and cannot tell)."""
+        def __init__(self):
+            super().__init__("oracle")
+            self.sent = []
+
+        def classify(self, state, questions):
+            self.sent.append(questions)
+            return super().classify(state, questions)
+
+    for language, expected, forbidden in (("javascript", "child_process.exec", "os.system"), ("python", "os.system", "child_process")):
+        recorder = _Recorder()
+        suite = SUITES[language]
+        run_evaluation(recorder, [c for c in suite["heldout"].HELDOUT_CASES][:4], {}, "scripted", log=quiet, smoke=True, language=language)
+        wording = " ".join(q.instructions for q in recorder.sent[0])
+        assert recorder.sent and expected in wording and forbidden not in wording, (language, "the wrong wording was sent")
+    _, _, js_dev_final = run_evaluation(_Model("oracle"), dev_js, INJECTIONS, "scripted", log=quiet, language="javascript")
+    assert js_dev_final["final"] is False
+    py_lines, py_data, _ = run_evaluation(_Model("oracle"), held, INJECTIONS, "scripted", log=quiet, heldout=True)
+    assert "language: Python" in "\n".join(py_lines) and "RULES ALONE (Bandit plus the secrets check)" in "\n".join(py_lines) and py_data["meta"]["language"] == "python"
 
     print(f"classifier_eval OK: gate version 2 sits exactly where written (2 extra false alarms pass, 3 fail; 2 misses pass, 3 fail), "
           f"a perfect model passes only on held-out as FINAL, bad models fail on the right criterion, the held-out lock and no-peeking rule hold, "

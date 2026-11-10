@@ -260,7 +260,10 @@ def demo() -> None:
             with tempfile.TemporaryDirectory() as folder:
                 (__import__("pathlib").Path(folder) / "f.py").write_bytes(a.encode())
                 (__import__("pathlib").Path(folder) / "d.diff").write_bytes(make_unified_diff("f.py", a, b).encode())
-                done = subprocess.run([git, "apply", "--unsafe-paths", "d.diff"], cwd=folder, capture_output=True, text=True)
+                config = __import__("pathlib").Path(folder) / "windows-style.gitconfig"        # force git's Windows default (convert line endings) so this cannot pass by luck
+                config.write_text("[core]\n\tautocrlf = true\n", encoding="utf-8")
+                env = {**__import__("os").environ, "GIT_CONFIG_GLOBAL": str(config), "GIT_CONFIG_NOSYSTEM": "1"}
+                done = subprocess.run([git, "-c", "core.autocrlf=false", "-c", "core.safecrlf=false", "apply", "--unsafe-paths", "d.diff"], cwd=folder, capture_output=True, text=True, env=env)
                 assert done.returncode == 0, done.stderr
                 assert (__import__("pathlib").Path(folder) / "f.py").read_bytes().decode() == b == apply_unified_diff(a, make_unified_diff("f.py", a, b), "f.py")
 

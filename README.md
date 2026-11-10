@@ -37,6 +37,7 @@ screenshot it. `.env.example` is the committed template and contains placeholder
 | `CLASSIFIER_ENABLED` | no | `false` | `true` also asks Decision-1 about every Python file in a real scan (see below). |
 | `CLASSIFIER_REQUIRED` | no | `false` | `true` makes a Decision-1 outage turn a would-be pass into `scan_failed`. |
 | `CLASSIFIER_THRESHOLD` | no | `0.70` | Probability at or above which a category becomes a finding. 0.70 is what the held-out test validated. |
+| `CLASSIFIER_LANGUAGES` | no | `python` | Languages Decision-1 is asked about. Add `javascript` (which covers TypeScript) only after `python -m benchmark.classifier_eval --language javascript --heldout` passes; until then it warns. |
 | `CORRECTOR_DEPLOYMENT` | for fixes | none | The exact Name of the GPT-6 Astra deployment in Foundry (not the model's display name; no spaces). |
 | `CORRECTOR_ENDPOINT`, `CORRECTOR_API_KEY` | no | the Decision-1 ones | Only if Astra is in a different Foundry resource. |
 | `CORRECTOR_API` | no | `openai_v1` | Which route to call, `openai_v1` or `inference`; `tests.live_corrector --both` finds the one that works. |
@@ -109,6 +110,71 @@ How a fix is asked for, and why:
 - Astra's rules, as we know them: `max_completion_tokens` (not `max_tokens`), no temperature, effort `low`/`medium`/`high`/`xhigh`,
   no tools (those need the Responses API). Thinking counts against the output cap, so a cap that is too small gives an empty answer,
   which is reported as such.
+
+## Using Phylax from a coding agent: the review client (`clients/typescript/`)
+
+Phylax stays a separate service that never touches your files. The way an agent uses it is an OPTIONAL review the user asks for after the agent has finished its task,
+not a step inside the agent's loop. A small TypeScript client (`clients/typescript/`, see its README) runs the workflow: scan the chosen files, list the findings, let the
+person choose which to correct, show each correction as a diff, apply it only after an explicit yes, then verify what is on disk. It reaches an agent through two small
+interfaces (`FileChanger` and `Approver`), so it is not tied to Oqelira: Oqelira has an adapter built on its own `changes.mjs`, a plain-folder adapter works with any agent,
+and a command-line tool (`phylax-review`) works with none. Run its tests with `python -m tests.check_ts_client` (needs Node 20+ and `npm install` once in that folder).
+
+Which findings are offered a correction is decided by the service, per finding, in `finding.fix` (contract 1.3.0): medium severity and above yes; low and informational
+reported only; a hardcoded secret never. It does not depend on the verdict: a medium finding is offered when the decision is only `review_required`, and a `block` does
+not make a low finding eligible.
+
+## Applying a fix exactly (for tools like Oqelira's apply_file_change)
+
+Oqelira's `applyFileChange` takes the WHOLE new file plus the SHA-256 of the file it expects to replace, not a diff, and refuses if the file
+changed in between. Phylax returns what it needs (contract 1.2.0, additive):
+
+- `coverage.scanned_files`: each scanned file's path and the SHA-256 of its text as submitted (UTF-8, line endings included).
+- on each patch: `base_sha256` (the hash of the text that was scanned and patched), `corrected_content` (the whole file after the patch) and
+  `corrected_sha256` (its hash). `unified_diff` stays for people and for `git apply`.
+
+The client flow: snapshot the file on disk; if its hash is not the patch's `base_sha256`, the file changed after the scan, so scan again and
+do not apply; otherwise ask a person, then call `applyFileChange({path, expected_sha256: base_sha256, content: corrected_content})`. Afterwards the
+file hashes to `corrected_sha256`, and Oqelira's own revert restores the original (which hashes to `base_sha256` again).
+
+Windows line endings: the model is shown normalized text, and a file whose every line ends in CRLF comes back with CRLF (the diff too, so
+`git apply` takes it); a file with mixed endings comes back with LF. Before this, a fix on a CRLF file always failed (the model's edits never
+matched the `\r\n` text). The hash is of the text exactly as submitted, so the client must send the file's text unchanged.
+
+Limits that belong to the apply tool, not Phylax: it takes files up to 10,000 characters (40,000 bytes), so check `corrected_content` before sending
+it; it refuses `.env`, key files and anything under `.git` or `.oqelira`. `tests/check_interop.py` runs Oqelira's real `changes.mjs` under Node
+(a copy is in `tests/fixtures/`) and proves all of this on real files: equal hashes for LF, CRLF and non-ASCII text, a Phylax patch accepted, a stale
+patch refused, and an exact revert. It needs Node and says SKIPPED without it.
+
+## JavaScript and TypeScript
+
+Phylax scans `.js .jsx .mjs .cjs .ts .tsx` as well as Python. Needs `pip install -r requirements.txt` (the parser packages; prebuilt, no compiler,
+no Node). Without them JavaScript files are skipped and can never pass, and `python -m security_service.config` says so.
+
+Why our own rules: the best-known free rule collection for these languages is licensed for internal, non-SaaS use only, and Phylax is
+offered as a service, so we wrote our own on the tree-sitter parsers (MIT licence). Flwn's legal side should still confirm that choice.
+
+What the 25 rules (`adapters/js_rules.py`) understand: real structure, not text (a comment that mentions `eval(` is nothing); constants
+(`const CMD = "ls"; exec(CMD)` is fine); user input one hop (`const id = req.query.id` makes `id` input); where a name came from (`exec` is a
+command sink only if it came from `child_process`); TypeScript (`as`, `!`, generics, decorators, JSX in a .ts file). Only unambiguous
+patterns can block (`eval` of a variable, `exec` of a built string, `shell: true`, `rejectUnauthorized: false`, `new Function`, node-serialize);
+everything else asks for review.
+
+What it does not do, said plainly: it follows nothing across functions or files, and cannot tell a sanitized value from an unsanitized one
+beyond a few simple guards (so Decision-1 is meant to find what it cannot); the verifier checks that a fixed JavaScript file PARSES, but not
+that it uses no undefined name (that needs scope analysis), and says so in the result: run the project's build or tests after applying;
+and Decision-1 is not asked about JavaScript until it has passed its own held-out test (see below), so until then JavaScript files are covered by
+the rules alone.
+
+Decision-1 on JavaScript and TypeScript: the twelve questions are written for the language (`_CATEGORY_TEXT_JS`), judged the way the Python set was.
+`benchmark/cases_javascript.py` (51 cases) is for tuning; `benchmark/cases_heldout_js.py` (39 cases, nine vulnerabilities the rules cannot see,
+fingerprint-locked) is for one final run. The gate, the procedure and what a pass or a fail changes were written down before any model saw a case:
+`benchmark/results/js_gate_preregistration.md`. Run `python -m benchmark.classifier_eval --language javascript --limit 3`, then without `--limit`
+for a development run, then (once, after the wording is frozen) with `--heldout`. A pass lets `CLASSIFIER_LANGUAGES=python,javascript` stop warning
+(after `VALIDATED_LANGUAGES` in `config.py` is updated); the model still only asks for review and never blocks. The rules alone score 6 of 14 on the
+held-out set, so the model has to add something to pass.
+
+Folders: `python -m security_service.scan src` and `...fix src` find JavaScript and TypeScript files too, skipping `node_modules`, `vendor`,
+`dist`, `build`, `.next`, minified or bundled files (`*.min.js`, `*.bundle.js`) and declaration files (`*.d.ts`).
 
 ## The HTTP service
 
@@ -263,6 +329,14 @@ Run on real code with the real Astra: the fix and verification services (`python
 
 Built and tested end to end over real sockets, against a test double of Astra: the fix and verification endpoints of the HTTP service. Not yet run with the real Astra through the service.
 
+Built for exact apply: file hashes in the scan report, the whole corrected file and both hashes on every patch, Windows line endings preserved, all tested against Oqelira's real change code.
+
+Built for JavaScript and TypeScript: our own 25 rules, the secrets check, folder scanning, the verifier's syntax check, language-aware instructions to the corrector, all tested on a deliberately vulnerable Node app (NodeGoat).
+
+Built for Decision-1 on JavaScript and TypeScript: the questions, 51 development and 39 held-out cases, a language switch in the evaluation, and a setting that keeps it off until it passes. NOT yet run against the real model.
+
+Not built yet for JavaScript and TypeScript: the result of Decision-1's held-out test, the undefined-name check, and a real Astra fix run on JavaScript. Not built yet: Java.
+
 Not built yet: the measured fix-quality test (the pass/fail rule fixed first, then new cases), an optional behavior check that runs a project's own tests, the Flwn side of the
 integration, chunking of large files for the model, a persistent job store and a shared rate limiter for running several
 instances, TLS, and the C++, C# and JS lanes.
@@ -316,6 +390,8 @@ instances, TLS, and the C++, C# and JS lanes.
 - A fix is applicable only when verification PASSED; a re-scan that cannot run is inconclusive, never a pass. Nothing is ever applied by Phylax.
 - The corrector asks for exact whole-line edits, not a rewritten file; anything that does not fit the file exactly is refused.
   It never applies a patch. A fix is offered only after the fix service parses and re-scans it, and a person still approves.
+- JavaScript and TypeScript rules are our own, on MIT-licensed parsers, because the common rule collections exclude SaaS use. The secrets check is
+  widened to a language only together with a rules engine for it, so a file never counts as scanned on secrets alone.
 - A secret found by pattern asks for human review but never blocks on its own: a pattern cannot tell a
   live key from the documented example key, and only HIGH confidence blocks. Masking is liberal (a
   missed secret leaks); reporting is careful (every report is an alarm). The known gap: a real secret

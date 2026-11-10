@@ -4,8 +4,10 @@ security_service/paths.py
 What a person types on the command line, turned into the files to scan and the names to call them.
 
   - A FILE is used as given, whatever its extension (an unsupported one is then reported as skipped, not hidden).
-  - A FOLDER is searched recursively for *.py files, skipping the folders that hold other people's code or build output
-    (.git, venv, .venv, env, __pycache__, node_modules, site-packages, build, dist, and the like). Hidden folders are skipped.
+  - A FOLDER is searched recursively for the source files Phylax can scan (.py .js .jsx .mjs .cjs .ts .tsx), skipping the folders that
+    hold other people's code or build output (.git, venv, node_modules, site-packages, vendor, build, dist, .next, coverage and the like;
+    hidden folders too) and the files that are not source anyone writes: minified or bundled code (*.min.js, *.bundle.js) and TypeScript
+    declaration files (*.d.ts). A file you name yourself is always used, whatever it is.
   - Every file gets a LABEL, the path shown in reports and written into patches, chosen so that `git apply` works:
         1. relative to the folder you are standing in, when the file is inside it (the normal case);
         2. otherwise relative to the root of the git repository the file belongs to, when it has one;
@@ -23,7 +25,15 @@ import os
 from pathlib import Path
 
 SKIP_FOLDERS = {".git", ".hg", ".svn", "venv", ".venv", "env", "__pycache__", "node_modules", "site-packages", ".tox", ".nox",
-                ".mypy_cache", ".pytest_cache", ".ruff_cache", "build", "dist", ".eggs", ".idea", ".vscode"}
+                ".mypy_cache", ".pytest_cache", ".ruff_cache", "build", "dist", ".eggs", ".idea", ".vscode",
+                "vendor", "vendors", "third_party", "bower_components", ".next", ".nuxt", "coverage", ".turbo", ".cache", ".parcel-cache", ".svelte-kit"}
+SOURCE_SUFFIXES = (".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
+NOT_SOURCE_ENDINGS = (".min.js", ".min.mjs", ".min.cjs", ".bundle.js", ".d.ts", ".d.mts", ".d.cts")
+
+
+def _is_source(path: Path) -> bool:
+    name = path.name.lower()
+    return name.endswith(SOURCE_SUFFIXES) and not name.endswith(NOT_SOURCE_ENDINGS)
 
 
 class PathProblem(Exception):
@@ -35,6 +45,31 @@ def _git_root(path: Path) -> Path | None:
         if (parent / ".git").exists():
             return parent
     return None
+
+
+def _ordered(paths: list[Path]) -> list[Path]:
+    """The same order on every operating system. Plain sorted() on Windows paths ignores letter case (Widget.jsx after index.ts) and on Linux does not,
+    so the files of a folder would come back in a different order, and be numbered differently, depending on where Phylax runs."""
+    return sorted(paths, key=lambda p: p.as_posix())
+
+
+def confine_git_root(limit: Path):
+    """FOR TESTS. A git folder ABOVE `limit` (a home folder that was once `git init`-ed, say) must not change how the files inside `limit` are labelled,
+    because the labelling rules use the nearest git root. Until the returned function is called, only a git folder inside `limit` counts."""
+    global _git_root
+    original, limit = _git_root, limit.resolve()
+
+    def confined(path: Path) -> Path | None:
+        root = original(path)
+        return root if root is not None and (root == limit or limit in root.parents) else None
+
+    _git_root = confined
+
+    def restore() -> None:
+        global _git_root
+        _git_root = original
+
+    return restore
 
 
 def _inside(path: Path, base: Path) -> Path | None:
@@ -59,10 +94,10 @@ def expand(arguments: list[str], cwd: Path | None = None) -> list[tuple[Path, st
         except OSError as problem:
             raise PathProblem(f"Cannot read {argument}: {problem.strerror or problem}") from None
         if resolved.is_dir():
-            inside = sorted(p for p in resolved.rglob("*.py")
-                            if p.is_file() and not any(part in SKIP_FOLDERS or (part.startswith(".") and part not in (".", "..")) for part in p.relative_to(resolved).parts[:-1]))
+            inside = _ordered([p for p in resolved.rglob("*")
+                               if p.is_file() and _is_source(p) and not any(part in SKIP_FOLDERS or (part.startswith(".") and part not in (".", "..")) for part in p.relative_to(resolved).parts[:-1])])
             if not inside:
-                raise PathProblem(f"No Python files found in {argument} (folders such as .git, venv, node_modules and build are skipped)")
+                raise PathProblem(f"No source files that Phylax can scan (Python, JavaScript, TypeScript) were found in {argument} (folders such as .git, venv, node_modules, vendor and build are skipped)")
             found.extend(inside)
             origin.update({p: resolved for p in inside})
         elif resolved.is_file():
@@ -107,8 +142,16 @@ def expand(arguments: list[str], cwd: Path | None = None) -> list[tuple[Path, st
 def demo() -> None:
     import tempfile
 
+    from pathlib import PureWindowsPath
+
+    # the order is the same everywhere: plain sorted() puts alpha before Zeta for Windows paths, and Zeta before alpha for Linux ones
+    mixed = [PureWindowsPath("a/alpha.py"), PureWindowsPath("a/Zeta.py"), PureWindowsPath("a/Beta.py"), PureWindowsPath("a/sub/Alpha.py")]
+    assert [p.as_posix() for p in _ordered(mixed)] == ["a/Beta.py", "a/Zeta.py", "a/alpha.py", "a/sub/Alpha.py"]
+    assert [p.as_posix() for p in sorted(mixed)] != [p.as_posix() for p in _ordered(mixed)], "sorted() would have ordered these differently on Windows"
+
     with tempfile.TemporaryDirectory() as folder:
         root = Path(folder).resolve()
+        restore_git = confine_git_root(root)                    # whatever is above the temp folder (a git home folder, say) must not change the labels below
         (root / "app").mkdir()
         (root / "app" / "sub").mkdir()
         (root / "app" / "venv").mkdir()
@@ -122,6 +165,15 @@ def demo() -> None:
         for name in ("app/main.py", "app/sub/util.py", "app/venv/skip.py", "app/__pycache__/skip.py", "app/.hidden/skip.py", "app/node_modules/skip.py",
                      "app/readme.md", "other/pkg/lib.py", "other/pkg/lib2.py", "lonely.py"):
             (root / name).write_text("x = 1\n", encoding="utf-8")
+
+        # a JavaScript and TypeScript project: source files are found; minified bundles, declaration files, vendor and build folders are not
+        web = root / "web"
+        for name in ("src/index.ts", "src/App.tsx", "src/util.js", "src/lib.mjs", "src/legacy.cjs", "src/Widget.jsx", "src/types.d.ts", "src/app.min.js", "src/app.bundle.js",
+                     "vendor/jquery.js", "dist/main.js", "build/out.js", "node_modules/x/index.js", ".next/server/page.js", "coverage/lcov.js", "public/vendor/lib.js", "README.md", "package.json"):
+            (web / name).parent.mkdir(parents=True, exist_ok=True)
+            (web / name).write_text("x = 1\n", encoding="utf-8")
+        assert [label for _, label in expand(["web"], cwd=root)] == ["web/src/App.tsx", "web/src/Widget.jsx", "web/src/index.ts", "web/src/legacy.cjs", "web/src/lib.mjs", "web/src/util.js"]
+        assert [label for _, label in expand(["web/dist/main.js", "web/src/app.min.js", "web/src/types.d.ts"], cwd=root)] == ["web/dist/main.js", "web/src/app.min.js", "web/src/types.d.ts"]   # named files are always used
 
         # standing in the folder: labels are relative to it, with forward slashes, in sorted order
         pairs = expand(["app"], cwd=root)
@@ -168,12 +220,34 @@ def demo() -> None:
                 assert not label.startswith(("/", "..")) and "\\\\" not in label and ":" not in label and ".." not in label.split("/"), label
 
         # problems are said in words, not with an operating system's cryptic message
-        for argument, needle in (("nope.py", "No such file or folder"), ("empty", "No Python files found in empty")):
+        for argument, needle in (("nope.py", "No such file or folder"), ("empty", "No source files that Phylax can scan")):
             try:
                 expand([argument], cwd=root)
                 raise AssertionError(f"{argument} must be refused")
             except PathProblem as problem:
                 assert needle in str(problem), str(problem)
+
+    restore_git()
+    # confine_git_root: a git folder ABOVE the limit is ignored, one AT the limit (or inside it) still counts, and restoring puts everything back
+    with tempfile.TemporaryDirectory() as outer_folder:
+        outer = Path(outer_folder).resolve()
+        (outer / ".git").mkdir()
+        inner, elsewhere2 = outer / "work", outer / "elsewhere"
+        (inner / "pkg").mkdir(parents=True)
+        elsewhere2.mkdir()
+        (inner / "pkg" / "m.py").write_text("x = 1\n", encoding="utf-8")
+        target = [str(inner / "pkg" / "m.py")]
+        labels = lambda: [label for _, label in expand(target, cwd=elsewhere2)]
+        assert labels() == ["work/pkg/m.py"]                                     # labelled from the outer git root
+        undo = confine_git_root(inner)
+        assert labels() == ["m.py"]                                              # the outer git root is above the limit: ignored
+        undo()
+        assert labels() == ["work/pkg/m.py"]                                     # and restored
+        (inner / ".git").mkdir()
+        undo = confine_git_root(inner)
+        assert labels() == ["pkg/m.py"]                                          # a git folder AT the limit counts
+        undo()
+        assert labels() == ["pkg/m.py"]                                          # (now it is the nearest root even without the helper)
 
     print("paths OK: files and folders, junk folders skipped, labels relative to where you stand (else the git root, else the common parent), unique, never absolute")
 

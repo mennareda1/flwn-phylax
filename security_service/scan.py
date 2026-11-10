@@ -28,7 +28,7 @@ from pathlib import Path
 from security_service.config import Settings, load_env_file
 from security_service.core.files import InvalidScanInput, SourceFile
 from security_service.core.scan_service import ScanService
-from security_service.paths import PathProblem, expand
+from security_service.paths import PathProblem, confine_git_root, expand
 
 EXIT_CODES = {"pass": 0, "review_required": 1, "block": 2, "scan_failed": 3}
 COULD_NOT_START = 4
@@ -75,7 +75,7 @@ def main(argv: list[str], environ=None, classifier=None, out=print) -> int:
         out(str(problem))
         return COULD_NOT_START
     if len(located) > settings.scan_max_files:
-        out(f"Found {len(located)} Python files, and one scan takes at most {settings.scan_max_files} (SCAN_MAX_FILES in .env). Give a smaller folder, or raise the limit.")
+        out(f"Found {len(located)} source files, and one scan takes at most {settings.scan_max_files} (SCAN_MAX_FILES in .env). Give a smaller folder, or raise the limit.")
         return COULD_NOT_START
     files = []
     for file, label in located:
@@ -103,6 +103,7 @@ def demo() -> None:
     shown: list[str] = []
     say = shown.append
     with tempfile.TemporaryDirectory() as folder:
+        confine_git_root(Path(folder))          # a git folder above the temp folder must not change the labels
         bad, good, odd = Path(folder) / "bad.py", Path(folder) / "good.py", Path(folder) / "notes.md"
         bad.write_text('import os\n\ndef ping(host):\n    os.system("ping " + host)\n', encoding="utf-8")
         good.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
@@ -135,10 +136,10 @@ def demo() -> None:
             (tree / "pkg" / f"m{number}.py").write_text("x = 1\n", encoding="utf-8")
         assert main([str(tree)], environ=off, out=say) == 2 and "coverage: scanned 12 files;" in "\n".join(shown)                 # many files: counted, not listed
         shown.clear()
-        assert main([str(tree)], environ={"SCAN_MAX_FILES": "5"}, out=say) == COULD_NOT_START and "Found 12 Python files" in shown[-1] and "SCAN_MAX_FILES" in shown[-1]
+        assert main([str(tree)], environ={"SCAN_MAX_FILES": "5"}, out=say) == COULD_NOT_START and "Found 12 source files" in shown[-1] and "SCAN_MAX_FILES" in shown[-1]
         shown.clear()
         (Path(folder) / "empty").mkdir()
-        assert main([str(Path(folder) / "empty")], environ=off, out=say) == COULD_NOT_START and "No Python files found" in shown[-1]
+        assert main([str(Path(folder) / "empty")], environ=off, out=say) == COULD_NOT_START and "No source files that Phylax can scan" in shown[-1]
         shown.clear()
 
         # --json is the full report

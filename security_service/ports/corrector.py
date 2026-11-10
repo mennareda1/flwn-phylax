@@ -51,6 +51,13 @@ class Patch:
     finding_ids: tuple[str, ...]
     unified_diff: str
     explanation: str
+    # Filled in by the fix service (a corrector leaves them empty). They exist because a client such as Oqelira's apply_file_change takes the WHOLE new
+    # file plus the hash of the file it expects to replace, not a diff: base_sha256 is the hash of the text that was scanned (use it as the expected
+    # hash; if the file on disk hashes differently it has changed since and the patch is stale), corrected_content is the file after the patch with the
+    # original line endings, and corrected_sha256 is its hash (the hash the client will see after applying).
+    base_sha256: str = ""
+    corrected_content: str = ""
+    corrected_sha256: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -58,6 +65,9 @@ class Patch:
             "finding_ids": list(self.finding_ids),
             "unified_diff": self.unified_diff,
             "explanation": self.explanation,
+            "base_sha256": self.base_sha256,
+            "corrected_content": self.corrected_content,
+            "corrected_sha256": self.corrected_sha256,
         }
 
 
@@ -74,7 +84,10 @@ def demo() -> None:
     assert issubclass(CorrectorUnavailable, CorrectorError) and issubclass(CorrectorRejected, CorrectorError) and issubclass(BadProposal, CorrectorError)
     assert CorrectorRejected("no", status=404).status == 404 and CorrectorRejected("no").status is None
     patch = Patch("a.py", ("f1",), "--- a/a.py\n+++ b/a.py\n", "why")
-    assert patch.to_dict() == {"path": "a.py", "finding_ids": ["f1"], "unified_diff": "--- a/a.py\n+++ b/a.py\n", "explanation": "why"}
+    assert patch.to_dict() == {"path": "a.py", "finding_ids": ["f1"], "unified_diff": "--- a/a.py\n+++ b/a.py\n", "explanation": "why",
+                               "base_sha256": "", "corrected_content": "", "corrected_sha256": ""}        # a corrector leaves the hashes and the whole file to the fix service
+    finished = Patch("a.py", ("f1",), "d", "why", "a" * 64, "x = 1\n", "b" * 64)
+    assert finished.to_dict()["base_sha256"] == "a" * 64 and finished.to_dict()["corrected_content"] == "x = 1\n" and finished.to_dict()["corrected_sha256"] == "b" * 64
     assert FixConstraints().max_patch_lines == 40
     print("ports.corrector OK: patch shape")
 

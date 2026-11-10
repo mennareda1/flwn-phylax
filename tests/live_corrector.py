@@ -6,6 +6,8 @@ came back, so a problem is visible in one run instead of guessed at:
 
     python -m tests.live_corrector               one request, on the route in CORRECTOR_API
     python -m tests.live_corrector --both        try both routes, say which works, and what to put in .env
+    python -m tests.live_corrector --sample js       a JavaScript sample (command injection through child_process.exec)
+    python -m tests.live_corrector --sample ts       a TypeScript sample (SQL built with a template literal)
     python -m tests.live_corrector --sample upload   a path-traversal sample instead (the rules cannot verify that one)
     python -m tests.live_corrector --show-raw    also print the model's raw reply
 
@@ -22,10 +24,9 @@ from __future__ import annotations
 import ast
 import sys
 
-from security_service.adapters.bandit import BanditAnalyzer
 from security_service.adapters.foundry_chat import ROUTES, FoundryChat
-from security_service.adapters.foundry_corrector import FoundryCorrector
-from security_service.adapters.secrets_check import SecretsAnalyzer
+from security_service.adapters.foundry_corrector import FoundryCorrector, language_of
+from security_service.adapters.js_rules import check_syntax as js_syntax
 from security_service.config import Settings, load_env_file
 from security_service.core.files import SourceFile
 from security_service.core.scan_service import ScanService
@@ -37,6 +38,8 @@ PRICE_OUTPUT_PER_MILLION = 50.0
 
 SAMPLES = {
     "ping": SourceFile("net.py", 'import os\n\n\ndef ping(host):\n    os.system("ping " + host)\n    return True\n'),
+    "js": SourceFile("run.js", 'const { exec } = require("child_process");\n\nfunction run(dir) {\n  exec(`ls ${dir}`);\n}\n'),
+    "ts": SourceFile("db.ts", 'export function find(id: string) {\n  return pool.query(`SELECT * FROM t WHERE id = ${id}`);\n}\n'),
     "upload": SourceFile("upload.py", 'import os\n\n\ndef read_upload(name):\n    with open(os.path.join("/srv/uploads", name)) as handle:\n        return handle.read()\n'),
 }
 
@@ -81,14 +84,21 @@ def try_route(settings: Settings, route: str, sample: SourceFile, findings, show
     out(f"patch for {patch.path}, fixing {', '.join(patch.finding_ids)}; the model says: {patch.explanation}\n")
     out(patch.unified_diff.rstrip())
 
-    # the checks the fix service will make
-    try:
-        ast.parse(proposal.fixed_code)
-        parses = True
-    except SyntaxError as problem:
-        parses = False
-        out(f"\nCHECK failed: the patched file does not parse ({problem.msg} at line {problem.lineno})")
-    rescan = ScanService([BanditAnalyzer(), SecretsAnalyzer()]).scan([SourceFile(sample.path, proposal.fixed_code)])
+    # the checks the fix service will make (parsing depends on the language of the file)
+    language = language_of(sample.path)
+    parses = True
+    if language == "python":
+        try:
+            ast.parse(proposal.fixed_code)
+        except SyntaxError as problem:
+            parses = False
+            out(f"\nCHECK failed: the patched file does not parse ({problem.msg} at line {problem.lineno})")
+    elif language in ("javascript", "typescript"):
+        message = js_syntax(proposal.fixed_code, language)
+        if message:
+            parses = False
+            out(f"\nCHECK failed: the patched file does not parse ({message})")
+    rescan = ScanService().scan([SourceFile(sample.path, proposal.fixed_code)])
     before = {f.vulnerability_type for f in findings}
     after = {f.vulnerability_type for f in rescan.findings if f.severity.rank >= Severity.MEDIUM.rank}
     gone = not (before & after)
@@ -119,7 +129,7 @@ def main(argv: list[str], environ=None, out=print) -> int:
         out(f"Unknown sample {sample_name!r}; choose one of: {', '.join(SAMPLES)}")
         return 2
     sample = SAMPLES[sample_name]
-    base = ScanService([BanditAnalyzer(), SecretsAnalyzer()]).scan([sample])
+    base = ScanService().scan([sample])
     findings = [f for f in base.findings if f.severity.rank >= Severity.MEDIUM.rank]
     out(f"\nsample {sample.path}: the rules alone say {base.decision.value} with {len(findings)} finding(s) at medium or above"
         + (f" ({', '.join(sorted({f.vulnerability_type for f in findings}))})" if findings else ""))

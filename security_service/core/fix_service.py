@@ -25,16 +25,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from security_service.core.files import SourceFile
-from security_service.core.patching import PatchError, apply_unified_diff
-from security_service.core.schema import Finding, Severity
+from security_service.core.files import SourceFile, detect_eol, normalize_newlines, sha256_text, with_eol
+from security_service.core.patching import PatchError, apply_unified_diff, make_unified_diff
+from security_service.core.schema import SECRET_REASON, SECRET_TYPE, Finding, Severity, fix_eligibility
 from security_service.core.verification import VerificationResult, VerificationService
 from security_service.ports.corrector import Corrector, CorrectorError, FixConstraints, Patch
 
 MAX_FILES = 10
 MAX_FINDINGS_PER_FILE = 10
-SECRET_TYPE = "hardcoded_credentials"
-SECRET_REASON = "A hardcoded secret is not fixed automatically: remove it from the code, move it to configuration, and rotate it, because it has been exposed."
 
 
 @dataclass(frozen=True)
@@ -104,8 +102,13 @@ class FixService:
             if source is None:
                 give_up("The file is not among the submitted files.")
                 continue
+            # The model reads and edits LF text (it answers in LF whatever the file uses, so an exact-match edit on a CRLF file would never fit). The
+            # file's own line endings are put back afterwards, so the corrected file and the diff match the file on disk.
+            original = source.content
+            eol = detect_eol(original)
+            working = normalize_newlines(original)
             try:
-                proposed = self._corrector.propose_fix(SourceFile(path, source.content), findings, constraints)
+                proposed = self._corrector.propose_fix(SourceFile(path, working), findings, constraints)
             except CorrectorError as problem:
                 give_up(f"The corrector could not produce a fix ({type(problem).__name__}: {problem}).")
                 continue
@@ -124,11 +127,13 @@ class FixService:
                 give_up("The corrector's patch does not say which of the requested findings it fixes.")
                 continue
             try:
-                text = apply_unified_diff(source.content, patch.unified_diff, path)
+                text = apply_unified_diff(working, patch.unified_diff, path)
             except PatchError as problem:
                 give_up(f"The corrector's patch does not apply to the file ({problem}).")
                 continue
-            patches.append(Patch(path, claimed, patch.unified_diff, patch.explanation))
+            text = with_eol(text, eol)
+            diff = make_unified_diff(path, original, text) if eol == "\r\n" else patch.unified_diff       # for a Windows file the diff keeps CRLF, so `git apply` takes it
+            patches.append(Patch(path, claimed, diff, patch.explanation, sha256_text(original), text, sha256_text(text)))
             corrected.append(SourceFile(path, text))
             unfixed.extend({"finding_id": f.id, "reason": "The corrector's patch does not claim to fix this finding."} for f in findings if f.id not in claimed)
 
@@ -172,10 +177,11 @@ def demo() -> None:
         role, name = "corrector", "scripted"
 
         def __init__(self, mode="good"):
-            self.mode, self.seen = mode, []
+            self.mode, self.seen, self.contents = mode, [], []
 
         def propose_fix(self, file, findings, constraints):
             self.seen.append((file.path, [f.id for f in findings], constraints.max_patch_lines))
+            self.contents.append(file.content)
             if self.mode == "unavailable":
                 raise CorrectorUnavailable("gpt-6-astra unavailable after 3 attempts (last: HTTP 503)")
             if self.mode == "bad":
@@ -211,6 +217,34 @@ def demo() -> None:
     assert len(ok.patches) == 1 and ok.patches[0].path == "a.py" and ok.patches[0].finding_ids == ("f1",)
     assert apply_unified_diff(one[0].content, ok.patches[0].unified_diff, "a.py") == "import os\nimport subprocess\n\ndef run(h):\n    " + SAFE + "\n"
     assert scripted.seen == [("a.py", ["f1"], 40)] and ok.verification.resolved_finding_ids == ("f1",)
+    # an exact apply needs the hash of what was scanned and the whole corrected file; for an LF file the diff is the corrector's own
+    safe_text = "import os\nimport subprocess\n\ndef run(h):\n    " + SAFE + "\n"
+    assert ok.patches[0].base_sha256 == sha256_text(one[0].content) and ok.patches[0].corrected_content == safe_text and ok.patches[0].corrected_sha256 == sha256_text(safe_text)
+    assert ok.to_dict()["patches"][0]["corrected_content"] == safe_text and ok.to_dict()["patches"][0]["base_sha256"] == sha256_text(one[0].content)
+
+    # a Windows (CRLF) file: the model is shown LF text, the corrected file and the diff keep CRLF, the hashes are of the text as it sits on disk
+    windows = [SourceFile("a.py", one[0].content.replace("\n", "\r\n"))]
+    seen_crlf = Scripted()
+    crlf_fix = fix(seen_crlf, windows)
+    assert crlf_fix.applicable and crlf_fix.verification.outcome == "passed" and "\r" not in seen_crlf.contents[0], crlf_fix.failure_reason
+    crlf_patch = crlf_fix.patches[0]
+    assert crlf_patch.corrected_content == safe_text.replace("\n", "\r\n") and crlf_patch.base_sha256 == sha256_text(windows[0].content) != sha256_text(one[0].content)
+    assert crlf_patch.corrected_sha256 == sha256_text(crlf_patch.corrected_content) and "\r\n" in crlf_patch.unified_diff
+    assert apply_unified_diff(windows[0].content, crlf_patch.unified_diff, "a.py") == crlf_patch.corrected_content            # the diff applies to the file exactly as it is
+    assert normalize_newlines(crlf_patch.corrected_content) == ok.patches[0].corrected_content                                # and says the same thing as the LF fix
+    # mixed line endings cannot be restored faithfully: the corrected file comes back with LF, and the fix still works
+    mixed = [SourceFile("a.py", "import os\r\n\ndef run(h):\r\n    os.system(h)\r\n")]
+    mixed_fix = fix(Scripted(), mixed)
+    assert mixed_fix.applicable and mixed_fix.patches[0].corrected_content == safe_text and mixed_fix.patches[0].base_sha256 == sha256_text(mixed[0].content)
+    assert fix(Scripted(), mixed, max_patch_lines=3).applicable          # three changed lines: line endings alone must not count as changes
+    only_endings = fix(Scripted(), [SourceFile("a.py", "import os\r\n\r\ndef run(h):\r\n    os.system(h)")])              # all CRLF, and no final newline at all
+    assert only_endings.applicable and only_endings.patches[0].corrected_content.endswith(SAFE) and "\r\n" in only_endings.patches[0].corrected_content
+    base_all = service.scan(one).findings
+    eligible_ids = {f.id for f in base_all if fix_eligibility(f).eligible}
+    attempted = fix(Scripted(), one)
+    covered = {i for p in attempted.patches for i in p.finding_ids} | {u["finding_id"] for u in attempted.unfixed}
+    assert eligible_ids and eligible_ids <= covered, "every finding the service calls eligible is attempted or explained"
+    assert {f.id for f in base_all if f.severity.rank < Severity.MEDIUM.rank} .isdisjoint(covered), "a low finding is not attempted by default"
     too_small = fix(Scripted(), max_patch_lines=2)                                                                # the patch has 3 changed lines; the limit is inclusive
     assert too_small.applicable is False and too_small.failure_reason == "Verification failed: 3 changed line(s), limit 2." and len(too_small.patches) == 1
     assert fix(Scripted(), max_patch_lines=3).applicable is True

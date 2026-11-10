@@ -21,6 +21,10 @@ from enum import Enum
 from typing import Any
 
 
+SECRET_TYPE = "hardcoded_credentials"
+SECRET_REASON = "A hardcoded secret is not fixed automatically: remove it from the code, move it to configuration, and rotate it, because it has been exposed."
+
+
 class Severity(str, Enum):
     INFO = "info"
     LOW = "low"
@@ -147,7 +151,30 @@ class Finding:
             "description": self.description,
             "recommendation": self.recommendation,
             "reference": self.reference,
+            "fix": fix_eligibility(self).to_dict(),
         }
+
+
+@dataclass(frozen=True)
+class FixEligibility:
+    """Whether a correction is offered for a finding by default, and why. It depends on the finding alone, never on the report's decision: a
+    finding can qualify while the decision is pass or review_required, and a block does not make a low finding eligible."""
+
+    eligible: bool
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"eligible": self.eligible, "reason": self.reason}
+
+
+def fix_eligibility(finding: "Finding") -> FixEligibility:
+    """The one rule. Medium severity and above is offered a correction; low and informational findings are reported only; a hardcoded secret is
+    never corrected by editing code. (A caller may still ask for a specific finding by id, except a secret; this is what is offered by default.)"""
+    if finding.vulnerability_type == SECRET_TYPE:
+        return FixEligibility(False, SECRET_REASON)
+    if finding.severity.rank < Severity.MEDIUM.rank:
+        return FixEligibility(False, "Low and informational findings are reported, not corrected by default.")
+    return FixEligibility(True, "Medium severity or above: a correction can be offered.")
 
 
 @dataclass
@@ -164,6 +191,7 @@ class SkippedFile:
 class Coverage:
     languages: list[str] = field(default_factory=list)
     files_scanned: list[str] = field(default_factory=list)
+    scanned_files: list[dict[str, str]] = field(default_factory=list)      # [{path, sha256}]: the exact text scanned, to match against the file on disk
     skipped_files: list[SkippedFile] = field(default_factory=list)
     analyzers_run: list[str] = field(default_factory=list)
     analyzers_failed: dict[str, str] = field(default_factory=dict)
@@ -173,6 +201,7 @@ class Coverage:
         return {
             "languages": list(self.languages),
             "files_scanned": list(self.files_scanned),
+            "scanned_files": [dict(f) for f in self.scanned_files],
             "skipped_files": [s.to_dict() for s in self.skipped_files],
             "analyzers_run": list(self.analyzers_run),
             "analyzers_failed": dict(self.analyzers_failed),

@@ -19,6 +19,7 @@ from dataclasses import replace
 
 from security_service.adapters.bandit import BanditAnalyzer
 from security_service.adapters.classifier_detector import ClassifierDetector
+from security_service.adapters.js_rules import JsRulesAnalyzer, available as js_available
 from security_service.adapters.secrets_check import SecretsAnalyzer
 from security_service.core.policy import decide, decide_nothing_scanned
 from security_service.core.files import (
@@ -28,6 +29,7 @@ from security_service.core.files import (
     SourceFile,
     UnsupportedLanguage,
     prepare_files,
+    sha256_text,
 )
 from security_service.core.schema import (
     Confidence,
@@ -117,6 +119,16 @@ def _skipped_note(skipped: list[SkippedFile]) -> tuple[str, ...]:
     return (f"Not scanned: {shown}{more}.",)
 
 
+def default_analyzers() -> list:
+    """The always-on engines: Bandit for Python, the secrets check, and our JavaScript and TypeScript rules when their parser packages are
+    installed. The secrets check covers a language only if a rules engine covers it too, so a file never counts as scanned on secrets alone."""
+    languages = ("python", "javascript", "typescript") if js_available() else ("python",)
+    analyzers: list = [BanditAnalyzer(), SecretsAnalyzer(languages)]
+    if js_available():
+        analyzers.append(JsRulesAnalyzer())
+    return analyzers
+
+
 class ScanService:
     def __init__(
         self,
@@ -124,7 +136,7 @@ class ScanService:
         strict_coverage: bool = True,
         limits: Limits | None = None,
     ):
-        self._analyzers: list[Analyzer] = analyzers if analyzers is not None else [BanditAnalyzer(), SecretsAnalyzer()]
+        self._analyzers: list[Analyzer] = analyzers if analyzers is not None else default_analyzers()
         # True: if any analyzer fails and nothing else was found, the result is SCAN_FAILED
         # (a PASS needs full coverage). False: a PASS may stand when an analyzer such as the
         # LLM is down, with the reduced coverage stated.
@@ -136,7 +148,7 @@ class ScanService:
         """The service as configured: rules and the secrets check always, plus Decision-1 when CLASSIFIER_ENABLED is on.
         If it is on but Decision-1 is not configured, this raises at once: failing loudly at startup beats quietly
         running without the engine someone believes is protecting them. `classifier` lets tests supply a stand-in."""
-        analyzers = [BanditAnalyzer(), SecretsAnalyzer()]
+        analyzers = default_analyzers()
         if settings.classifier_enabled:
             if classifier is None:
                 problems = settings.problems()
@@ -144,7 +156,7 @@ class ScanService:
                     raise ValueError("CLASSIFIER_ENABLED is on but Decision-1 is not ready: " + "; ".join(problems))
                 from security_service.adapters.decision1 import Decision1Classifier
                 classifier = Decision1Classifier.from_settings(settings)
-            analyzers.append(ClassifierDetector(classifier, settings.classifier_threshold, settings.classifier_required))
+            analyzers.append(ClassifierDetector(classifier, settings.classifier_threshold, settings.classifier_required, settings.classifier_languages))
         return cls(analyzers, limits=settings.limits(), **kwargs)
 
     @property
@@ -247,6 +259,7 @@ class ScanService:
             coverage=Coverage(
                 languages=sorted({f.language for f in prepared}),
                 files_scanned=[f.path for f in prepared],
+                scanned_files=[{"path": f.path, "sha256": f.sha256} for f in prepared],
                 skipped_files=skipped,
                 analyzers_run=sorted(analyzers_ok),
                 analyzers_failed=analyzers_failed,
@@ -309,6 +322,12 @@ def demo() -> None:
     report = service.scan_snippet("x = 1")
     assert report.decision == Decision.PASS and report.status == "completed"
     assert report.coverage.files_scanned == ["snippet"] and report.coverage.languages == ["python"]
+    assert report.coverage.scanned_files == [{"path": "snippet", "sha256": sha256_text("x = 1")}]
+    # the report names exactly what was scanned: the hash is of the text AS SUBMITTED, so a file with Windows line endings hashes as it sits on disk
+    crlf = service.scan([SourceFile("w.py", "x = 1\r\ny = 2\r\n"), SourceFile("l.py", "x = 1\ny = 2\n")])
+    assert crlf.coverage.scanned_files == [{"path": "w.py", "sha256": sha256_text("x = 1\r\ny = 2\r\n")}, {"path": "l.py", "sha256": sha256_text("x = 1\ny = 2\n")}]
+    assert crlf.coverage.scanned_files[0]["sha256"] != crlf.coverage.scanned_files[1]["sha256"]
+    assert [f["path"] for f in crlf.coverage.scanned_files] == crlf.coverage.files_scanned                                 # the two lists always agree
     assert report.coverage.not_assessable
     assert report.provenance.engines[0].role == "analyzer" and report.provenance.contract_version == CONTRACT_VERSION
 
@@ -456,15 +475,30 @@ def demo() -> None:
     assert ScanService([_StubAnalyzer("rules", [finding(src="rules")]), ClassifierDetector(Broken(outage))]).scan_snippet("x").decision == Decision.BLOCK
 
     # built from settings: off by default; on adds exactly the model engine with the configured threshold and strictness
-    assert [a.name for a in ScanService.from_settings(Settings.from_env({}))._analyzers] == ["bandit", "secrets"]
+    assert [a.name for a in ScanService.from_settings(Settings.from_env({}))._analyzers] == ["bandit", "secrets", "jsrules"]
     on_env = {"CLASSIFIER_ENABLED": "true", "CLASSIFIER_THRESHOLD": "0.8", "CLASSIFIER_REQUIRED": "true",
               "FOUNDRY_ENDPOINT": "https://r.services.ai.azure.com", "FOUNDRY_API_KEY": "k" * 32, "SCAN_MAX_FILES": "7"}
     stand_in = FakeClassifier(lambda state, q: Answer("yes_no", probability=0.01), name="stand-in")
     configured = ScanService.from_settings(Settings.from_env(on_env), classifier=stand_in)
     detector = configured._analyzers[-1]
-    assert [a.name for a in configured._analyzers] == ["bandit", "secrets", "stand-in"] and detector.threshold == 0.8 and detector.required is True
+    assert [a.name for a in configured._analyzers] == ["bandit", "secrets", "jsrules", "stand-in"] and detector.threshold == 0.8 and detector.required is True
     assert configured.limits.max_files == 7
     assert {"id": "python", "roles": ["analyzer", "classifier"]} in configured.capabilities()["languages"]
+    assert {"id": "javascript", "roles": ["analyzer"]} in configured.capabilities()["languages"] and detector.languages == ("python",)     # JavaScript is not asked until it has passed its test
+
+    # Decision-1 on JavaScript: only when CLASSIFIER_LANGUAGES says so; then it can flag what the rules cannot see, as a review (never a block)
+    sh_c = SourceFile("run.js", "const { spawn } = require('child_process');\nspawn('sh', ['-c', 'convert ' + file + ' out.png']);\n")
+    suspicious = FakeClassifier(lambda state, q: Answer("yes_no", probability=0.95 if q.id == "command_injection" else 0.01), name="suspicious")
+    off_for_js = ScanService.from_settings(Settings.from_env(on_env), classifier=suspicious).scan([sh_c])
+    assert off_for_js.decision == Decision.PASS and off_for_js.findings == []                                                    # the rules cannot see sh -c, and the model is not asked
+    on_for_js = ScanService.from_settings(Settings.from_env({**on_env, "CLASSIFIER_LANGUAGES": "python,javascript"}), classifier=suspicious)
+    assert {"id": "javascript", "roles": ["analyzer", "classifier"]} in on_for_js.capabilities()["languages"]
+    flagged = on_for_js.scan([sh_c])
+    assert flagged.decision == Decision.REVIEW_REQUIRED and [f.vulnerability_type for f in flagged.findings] == ["command_injection"]
+    assert flagged.findings[0].evidence_tier.value == "model_suspicion" and "execFile" in flagged.findings[0].recommendation and flagged.findings[0].line is None
+    assert "suspicious" in flagged.coverage.analyzers_run and flagged.decision != Decision.BLOCK                                  # a model alone never blocks
+    ts_flagged = on_for_js.scan([SourceFile("run.ts", "export const f = (n: string) => n;\n")])                                   # a TypeScript file is asked too
+    assert ts_flagged.decision == Decision.REVIEW_REQUIRED and "suspicious" in ts_flagged.coverage.analyzers_run
     try:                                          # on but not configured: fail loudly at startup, never run quietly without it
         ScanService.from_settings(Settings.from_env({"CLASSIFIER_ENABLED": "true"}))
         raise AssertionError("expected a refusal")
@@ -479,6 +513,51 @@ def demo() -> None:
             raise AssertionError("expected a refusal")
         except error:
             pass
+
+    # fix eligibility is a property of the FINDING, never of the report's decision
+    from security_service.core.schema import FixEligibility, SECRET_TYPE, fix_eligibility
+
+    table = {(sev, kind): fix_eligibility(Finding(kind, sev, Confidence.HIGH, EvidenceTier.STATIC_RULE, ["x"], "r", None, 1, "e", "d", "r")).eligible
+             for sev in Severity for kind in ("command_injection", SECRET_TYPE)}
+    assert table == {(Severity.INFO, "command_injection"): False, (Severity.LOW, "command_injection"): False, (Severity.MEDIUM, "command_injection"): True,
+                     (Severity.HIGH, "command_injection"): True, (Severity.CRITICAL, "command_injection"): True,
+                     (Severity.INFO, SECRET_TYPE): False, (Severity.LOW, SECRET_TYPE): False, (Severity.MEDIUM, SECRET_TYPE): False,
+                     (Severity.HIGH, SECRET_TYPE): False, (Severity.CRITICAL, SECRET_TYPE): False}
+    assert "rotate" in fix_eligibility(Finding(SECRET_TYPE, Severity.HIGH, Confidence.HIGH, EvidenceTier.STATIC_RULE, ["x"], "r", None, 1, "e", "d", "r")).reason
+    assert isinstance(fix_eligibility(Finding("sql_injection", Severity.MEDIUM, Confidence.LOW, EvidenceTier.MODEL_SUSPICION, ["m"], None, None, None, "", "d", "r")), FixEligibility)
+    real_rules = ScanService()
+    review_only = real_rules.scan([SourceFile("db.ts", "export const find = (id: string) => pool.query(`SELECT * FROM t WHERE id = ${id}`);\n")])
+    assert review_only.decision == Decision.REVIEW_REQUIRED and review_only.findings[0].to_dict()["fix"] == {"eligible": True, "reason": "Medium severity or above: a correction can be offered."}
+    quiet_low = real_rules.scan([SourceFile("t.js", "function makeResetToken() {\n  return Math.random().toString(36);\n}\n")])
+    assert quiet_low.decision == Decision.PASS and quiet_low.findings and quiet_low.findings[0].severity == Severity.LOW      # a low finding does not even change the decision...
+    assert quiet_low.findings[0].to_dict()["fix"]["eligible"] is False and "not corrected by default" in quiet_low.findings[0].to_dict()["fix"]["reason"]
+    blocked_with_low = real_rules.scan([SourceFile("a.js", "eval(x);\n"), SourceFile("b.js", "function makeSessionToken() {\n  return Math.random().toString(36);\n}\n")])
+    assert blocked_with_low.decision == Decision.BLOCK
+    by_rule = {f.rule_id: f.to_dict()["fix"]["eligible"] for f in blocked_with_low.findings}
+    assert by_rule == {"JS-EVAL": True, "JS-RANDOM": False}                                                                   # ...and a block does not make a low finding eligible
+    leaked_secret = real_rules.scan([SourceFile("c.js", 'const awsKey = "AKIAABCDEFGHIJKLMNOP";\n')])
+    assert leaked_secret.findings[0].vulnerability_type == SECRET_TYPE and leaked_secret.findings[0].to_dict()["fix"]["eligible"] is False
+
+    # JavaScript and TypeScript through the default engines: rules, secrets, folder of mixed languages, a broken file, and the capabilities
+    real = ScanService()
+    vulnerable_js = 'const { exec } = require("child_process");\nexec(`ls ${dir}`);\n'
+    js_report = real.scan([SourceFile("app/run.js", vulnerable_js)])
+    assert js_report.decision == Decision.BLOCK and js_report.findings[0].rule_id == "JS-EXEC" and js_report.findings[0].path == "app/run.js"
+    assert js_report.coverage.languages == ["javascript"] and sorted(js_report.coverage.analyzers_run) == ["jsrules", "secrets"]
+    ts_report = real.scan([SourceFile("src/db.ts", "export const find = (id: string) => pool.query(`SELECT * FROM t WHERE id = ${id}`);\n")])
+    assert ts_report.decision == Decision.REVIEW_REQUIRED and ts_report.findings[0].rule_id == "JS-SQL" and ts_report.coverage.languages == ["typescript"]
+    assert real.scan([SourceFile("ok.js", "const add = (a, b) => a + b;\n")]).decision == Decision.PASS
+    leaked = real.scan([SourceFile("cfg.js", 'const awsKey = "AKIAABCDEFGHIJKLMNOP";\nmodule.exports = { awsKey };\n')])      # the secrets check covers JavaScript too
+    assert leaked.decision == Decision.REVIEW_REQUIRED and leaked.findings[0].vulnerability_type == "hardcoded_credentials" and "AKIAABCDEFGHIJKLMNOP" not in json.dumps(leaked.to_dict())
+    broken_js = real.scan([SourceFile("bad.js", "function ( {")])                                                                      # a file that does not parse is a failed engine: never a pass
+    assert broken_js.decision == Decision.SCAN_FAILED and "does not parse" in json.dumps(broken_js.to_dict()["coverage"]["analyzers_failed"])
+    mixed = real.scan([SourceFile("a.py", "import os\nos.system(cmd)\n"), SourceFile("b.js", "eval(x);\n"), SourceFile("c.ts", "const n: number = 1;\n"), SourceFile("d.go", "package main\n")])
+    assert {f.path for f in mixed.findings} == {"a.py", "b.js"} and mixed.coverage.languages == ["javascript", "python", "typescript"]
+    assert [s.path for s in mixed.coverage.skipped_files] == ["d.go"] and mixed.decision == Decision.BLOCK                                # a language with no engine is still skipped, and says so
+    assert {"id": "javascript", "roles": ["analyzer"]} in real.capabilities()["languages"] and {"id": "typescript", "roles": ["analyzer"]} in real.capabilities()["languages"]
+    no_js = ScanService([BanditAnalyzer(), SecretsAnalyzer()])
+    skipped_js = no_js.scan([SourceFile("x.js", "eval(y);\n")])                                                                          # without the JavaScript engine, a .js file can never pass
+    assert skipped_js.decision == Decision.REVIEW_REQUIRED and skipped_js.coverage.skipped_files[0].reason == "unsupported_language" and skipped_js.coverage.skipped_files[0].blocks_pass
 
     # capabilities reflect the configured engines
     caps = ScanService([_StubAnalyzer("stub")]).capabilities()

@@ -1,0 +1,24 @@
+{
+  "name": "phylax-review",
+  "version": "0.1.0",
+  "description": "Review client for Phylax: scan the files you choose, offer corrections, apply the ones a person approves, and verify them. Works with any coding agent through two small interfaces.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "bin": {
+    "phylax-review": "dist/src/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node scripts/run-tests.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}

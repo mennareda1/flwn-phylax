@@ -37,7 +37,7 @@ from security_service.config import Settings, load_env_file
 from security_service.core.files import InvalidScanInput, SourceFile
 from security_service.core.fix_service import FixService
 from security_service.core.scan_service import ScanService
-from security_service.paths import PathProblem, expand
+from security_service.paths import PathProblem, confine_git_root, expand
 from security_service.core.schema import Severity
 from security_service.ports.corrector import CorrectorError
 
@@ -71,7 +71,7 @@ def main(argv: list[str], environ=None, out=print, corrector=None, scan_service=
         out(str(problem))
         return COULD_NOT_START
     if len(located) > settings.scan_max_files:
-        out(f"Found {len(located)} Python files, and one scan takes at most {settings.scan_max_files} (SCAN_MAX_FILES in .env). Give a smaller folder, or raise the limit.")
+        out(f"Found {len(located)} source files, and one scan takes at most {settings.scan_max_files} (SCAN_MAX_FILES in .env). Give a smaller folder, or raise the limit.")
         return COULD_NOT_START
     files = []
     for file, label in located:
@@ -201,6 +201,7 @@ def demo() -> None:
     shown: list[str] = []
     say = shown.append
     with tempfile.TemporaryDirectory() as folder:
+        confine_git_root(Path(folder))          # a git folder above the temp folder must not change the labels
         net, clean, notes = Path(folder) / "net.py", Path(folder) / "clean.py", Path(folder) / "notes.md"
         net.write_text(bad, encoding="utf-8")
         clean.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
@@ -280,7 +281,7 @@ def demo() -> None:
         assert saved_text.startswith("--- a/pkg/net.py\n+++ b/pkg/net.py\n") and str(folder) not in saved_text and ":" not in saved_text.splitlines()[0]
         shown.clear()
         (Path(folder) / "emptydir").mkdir()
-        assert main([str(Path(folder) / "emptydir")], environ=ready, out=say, corrector=Corrector()) == COULD_NOT_START and "No Python files found" in shown[-1]
+        assert main([str(Path(folder) / "emptydir")], environ=ready, out=say, corrector=Corrector()) == COULD_NOT_START and "No source files that Phylax can scan" in shown[-1]
         shown.clear()
 
         # --finding picks by id, --max-lines is passed on, and --json is the whole result

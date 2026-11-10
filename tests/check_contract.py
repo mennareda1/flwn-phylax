@@ -59,6 +59,11 @@ def rejects(name: str, instance) -> bool:
     return not validator(name).is_valid(instance)
 
 
+def must_reject(name: str, instance) -> None:
+    """The contract must REFUSE this data. (These checks used to call rejects() as a bare statement, which returns a bool nobody read, so they could never fail.)"""
+    assert rejects(name, instance), f"{name} accepted data it must reject"
+
+
 def run() -> None:
     # 1. the document itself
     validate_openapi(spec)
@@ -77,7 +82,7 @@ def run() -> None:
     files = [
         SourceFile("app/deploy.py", 'import os\n\ndef ping(host):\n    os.system("ping -c 1 " + host)\n'),
         SourceFile("app/clean.py", 'import subprocess\n\ndef ping(host):\n    subprocess.run(["ping", "-c", "1", host], check=True)\n'),
-        SourceFile("static/app.js", "let a = 1;"),                  # known source, no engine -> unsupported_language (blocks)
+        SourceFile("static/main.go", "package main"),               # known source, no engine -> unsupported_language (blocks)
         SourceFile("README.md", "# docs"),                           # not source -> unsupported_language (does not block)
         SourceFile("empty.py", "  \n"),                             # empty
         SourceFile("blob.py", "a\x00b"),                             # binary_or_invalid
@@ -163,8 +168,8 @@ def run() -> None:
     nothing = FixService(fixer, Silent()).fix(source, baseline)                                             # the model proposes nothing
     assert nothing.patches == () and nothing.unfixed and nothing.failure_reason
     check("Fix", as_fix(nothing))
-    rejects("Fix", {**as_fix(passing), "surprise": 1})                                                      # the contract is closed: unknown fields are errors
-    rejects("Fix", {**as_fix(nothing), "unfixed": [{"finding_id": "f1"}]})                                  # an unfixed entry needs its reason
+    must_reject("Fix", {**as_fix(passing), "surprise": 1})                                                      # the contract is closed: unknown fields are errors
+    must_reject("Fix", {**as_fix(nothing), "unfixed": [{"finding_id": "f1"}]})                                  # an unfixed entry needs its reason
     assert {"id": "python", "roles": ["analyzer", "classifier"]} in with_model.capabilities()["languages"]
     check("Capabilities", service.capabilities())
     check("Readiness", {"status": "ready", "checks": {"analyzers": "ok"}})
@@ -172,9 +177,22 @@ def run() -> None:
     # fix and verification shapes come from the same domain types the services will use
     patches = FakeCorrector("os.system(", "run(").propose_fix(files[0], report.findings, FixConstraints())
     assert patches
-    check("Patch", patches[0].to_dict())
+    check("Patch", passing.patches[0].to_dict())                                                          # a finished patch (the fix service fills in the hashes and the whole file)
+    must_reject("Patch", patches[0].to_dict())                                                                # a raw corrector patch has no hashes yet and must not pass for a finished one
+    must_reject("Patch", {**passing.patches[0].to_dict(), "base_sha256": "not-a-hash"})
+    must_reject("Patch", {k: v for k, v in passing.patches[0].to_dict().items() if k != "corrected_content"})
+    finding_dict = report.findings[0].to_dict()
+    check("Finding", finding_dict)
+    assert finding_dict["fix"]["eligible"] == (report.findings[0].severity.rank >= Severity.MEDIUM.rank) and finding_dict["fix"]["reason"]
+    must_reject("Finding", {k: v for k, v in finding_dict.items() if k != "fix"})                       # every finding carries its eligibility
+    must_reject("Finding", {**finding_dict, "fix": {"eligible": "yes", "reason": "x"}})
+    must_reject("Finding", {**finding_dict, "fix": {"eligible": True}})
+    must_reject("Finding", {**finding_dict, "fix": {"eligible": True, "reason": "x", "surprise": 1}})
+    scanned = report.to_dict()["coverage"]["scanned_files"]
+    assert scanned and all(len(f["sha256"]) == 64 for f in scanned) and [f["path"] for f in scanned] == report.coverage.files_scanned
+    must_reject("Coverage", {**report.to_dict()["coverage"], "scanned_files": [{"path": "a.py"}]})            # an entry without a hash is not allowed
     check("Fix", {"id": "fix_t", "scan_id": "scn_test", "status": "completed", "created_at": "2026-10-15T20:00:00Z",
-                  "completed_at": "2026-10-15T20:00:02Z", "patches": [p.to_dict() for p in patches],
+                  "completed_at": "2026-10-15T20:00:02Z", "patches": [p.to_dict() for p in passing.patches],
                   "verification": None, "applicable": False, "failure_reason": None})
 
     # 4. every error the core can raise maps to a Problem the contract allows

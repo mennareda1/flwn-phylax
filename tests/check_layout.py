@@ -55,6 +55,8 @@ EXPECTED_HOME = {
     "Settings": "security_service/config.py",
     "Decision1Classifier": "security_service/adapters/decision1.py",
     "ClassifierDetector": "security_service/adapters/classifier_detector.py",
+    "JsRulesAnalyzer": "security_service/adapters/js_rules.py",
+    "default_analyzers": "security_service/core/scan_service.py",
     "FoundryChat": "security_service/adapters/foundry_chat.py",
     "FoundryCorrector": "security_service/adapters/foundry_corrector.py",
     "apply_edits": "security_service/core/patching.py",

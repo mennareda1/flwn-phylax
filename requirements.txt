@@ -1,6 +1,12 @@
 # Runtime: the rules engine for Python
 bandit
 
+# Runtime: the parsers behind the JavaScript and TypeScript rules (prebuilt wheels, no compiler needed; the Java parser is for the Java lane)
+tree-sitter
+tree-sitter-javascript
+tree-sitter-typescript
+tree-sitter-java
+
 # Runtime: the HTTP service (python -m security_service.api)
 fastapi
 uvicorn

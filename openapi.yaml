@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Flwn security service API
-  version: 1.1.0
+  version: 1.3.0
   summary: Scan generated code for vulnerabilities, propose fixes, and verify them.
   description: |
     An independent service. It never imports Flwn code and never reads Flwn data. Flwn sends
@@ -489,10 +489,23 @@ components:
           items: {$ref: '#/components/schemas/InputFile'}
         context: {$ref: '#/components/schemas/ScanContext'}
 
+    FixEligibility:
+      type: object
+      additionalProperties: false
+      required: [eligible, reason]
+      description: >-
+        Whether a correction is offered for this finding by default. It depends on the finding alone and NEVER on the report's decision: a finding can be
+        eligible when the decision is pass or review_required, and a block does not make a low finding eligible. Medium severity and above is eligible; low and
+        informational findings are reported, not corrected by default; a hardcoded secret is never corrected by editing code. A caller may still request a
+        specific finding by id when asking for a fix (a secret excepted). Read this instead of re-implementing the rule.
+      properties:
+        eligible: {type: boolean}
+        reason: {type: string, description: Why, in a sentence a person can read.}
+
     Finding:
       type: object
       additionalProperties: false
-      required: [id, path, vulnerability_type, severity, confidence, evidence_tier, sources, rule_id, cwe, line, evidence, description, recommendation, reference]
+      required: [id, path, vulnerability_type, severity, confidence, evidence_tier, sources, rule_id, cwe, line, evidence, description, recommendation, reference, fix]
       properties:
         id:
           type: string
@@ -515,6 +528,8 @@ components:
         description: {type: string}
         recommendation: {type: string}
         reference: {type: [string, 'null']}
+        fix:
+          $ref: '#/components/schemas/FixEligibility'
 
     SkippedFile:
       type: object
@@ -529,14 +544,29 @@ components:
           type: boolean
           description: True for source files. A report that skipped such a file can never be a pass.
 
+    ScannedFile:
+      type: object
+      additionalProperties: false
+      required: [path, sha256]
+      properties:
+        path: {type: string}
+        sha256: {type: string, pattern: '^[a-f0-9]{64}$'}
+
     Coverage:
       type: object
       additionalProperties: false
-      required: [languages, files_scanned, skipped_files, analyzers_run, analyzers_failed, not_assessable]
+      required: [languages, files_scanned, scanned_files, skipped_files, analyzers_run, analyzers_failed, not_assessable]
       description: What was and was not checked. Read it before relying on a pass.
       properties:
         languages: {type: array, items: {type: string}}
         files_scanned: {type: array, items: {type: string}}
+        scanned_files:
+          type: array
+          description: >-
+            Exactly what was scanned: each file's path and the SHA-256 of its text as submitted (UTF-8, line endings included, the same hash
+            Oqelira's snapshot uses). Compare it with the hash of the file on disk before trusting or applying anything: a different hash means
+            the file changed after the scan.
+          items: {$ref: '#/components/schemas/ScannedFile'}
         skipped_files: {type: array, items: {$ref: '#/components/schemas/SkippedFile'}}
         analyzers_run: {type: array, items: {type: string}}
         analyzers_failed:
@@ -615,12 +645,15 @@ components:
               description: Starting a process with a shell, possible injection detected.
               recommendation: Avoid shell execution. Pass arguments as a list (no shell=True) and validate or allow-list any user-controlled values.
               reference: https://bandit.readthedocs.io/en/1.9.4/plugins/b605_start_process_with_a_shell.html
+              fix: {eligible: true, reason: 'Medium severity or above: a correction can be offered.'}
           summary: {total_findings: 1, critical: 0, high: 1, medium: 0, low: 0, info: 0}
           decision_reasons:
             - '1 high-severity, high-confidence finding(s) backed by static analysis (command_injection).'
           coverage:
             languages: [python]
             files_scanned: [app/deploy.py]
+            scanned_files:
+              - {path: app/deploy.py, sha256: d29c3859e71ca4d0f06a40ece617823849638129f9c89902c73fd255ab7c1798}
             skipped_files:
               - {path: README.md, reason: unsupported_language, blocks_pass: false}
             analyzers_run: [bandit]
@@ -631,7 +664,7 @@ components:
               - vulnerabilities in third-party dependencies
               - deployment, configuration and runtime behavior
           provenance:
-            contract_version: 1.1.0
+            contract_version: 1.3.0
             service_version: 0.1.0
             policy_version: policy-1
             engines:
@@ -673,12 +706,20 @@ components:
     Patch:
       type: object
       additionalProperties: false
-      required: [path, finding_ids, unified_diff, explanation]
+      required: [path, finding_ids, unified_diff, explanation, base_sha256, corrected_content, corrected_sha256]
+      description: >-
+        One file's fix. unified_diff is for humans and for `git apply`. For a tool that replaces a whole file (Oqelira's apply_file_change takes the
+        new content plus the hash of the file it expects), use the other three: apply corrected_content with base_sha256 as the expected hash. If the file on
+        disk no longer hashes to base_sha256 it has changed since the scan, so the patch is stale: scan again instead of applying it. After applying, the
+        file hashes to corrected_sha256. A file with Windows line endings keeps them; a file with mixed endings comes back with LF.
       properties:
         path: {type: string}
         finding_ids: {type: array, items: {type: string}}
         unified_diff: {type: string}
         explanation: {type: string}
+        base_sha256: {type: string, pattern: '^[a-f0-9]{64}$', description: SHA-256 of the file text that was scanned and patched.}
+        corrected_content: {type: string, description: The whole file after the patch.}
+        corrected_sha256: {type: string, pattern: '^[a-f0-9]{64}$', description: SHA-256 of corrected_content as UTF-8.}
 
     VerificationCheck:
       type: object
@@ -785,8 +826,11 @@ components:
           patches:
             - path: app/deploy.py
               finding_ids: [f1]
-              unified_diff: "--- a/app/deploy.py\n+++ b/app/deploy.py\n@@ -1,6 +1,6 @@\n-import os\n+import subprocess\n \n def ping(host):\n-    os.system(\"ping -c 1 \" + host)\n+    subprocess.run([\"ping\", \"-c\", \"1\", host], check=True)\n"
+              unified_diff: "--- a/app/deploy.py\n+++ b/app/deploy.py\n@@ -1,4 +1,4 @@\n-import os\n+import subprocess\n \n def ping(host):\n-    os.system(\"ping -c 1 \" + host)\n+    subprocess.run([\"ping\", \"-c\", \"1\", host], check=True)\n"
               explanation: Replaced the shell call with an argument list so the host cannot inject commands.
+              base_sha256: d29c3859e71ca4d0f06a40ece617823849638129f9c89902c73fd255ab7c1798
+              corrected_content: "import subprocess\n\ndef ping(host):\n    subprocess.run([\"ping\", \"-c\", \"1\", host], check=True)\n"
+              corrected_sha256: 6e6390a8651642c12ae2e727dde4a5b8ab9fdb267e33043de19acbdaf6e007df
           verification:
             id: ver_01
             scan_id: scn_01
@@ -839,7 +883,7 @@ components:
             fixes: {type: boolean}
             verifications: {type: boolean}
       examples:
-        - contract_version: 1.1.0
+        - contract_version: 1.3.0
           service_version: 0.1.0
           policy_version: policy-1
           languages:

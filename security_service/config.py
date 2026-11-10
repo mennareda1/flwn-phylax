@@ -45,7 +45,7 @@ VARIABLES = (
     "FOUNDRY_ENDPOINT", "FOUNDRY_API_KEY",
     "DECISION1_ENDPOINT", "DECISION1_API_KEY", "DECISION1_DEPLOYMENT", "DECISION1_MODEL_VERSION",
     "DECISION1_AUTH", "DECISION1_TIMEOUT", "DECISION1_MAX_ATTEMPTS",
-    "CLASSIFIER_ENABLED", "CLASSIFIER_REQUIRED", "CLASSIFIER_THRESHOLD",
+    "CLASSIFIER_ENABLED", "CLASSIFIER_REQUIRED", "CLASSIFIER_THRESHOLD", "CLASSIFIER_LANGUAGES",
     "CORRECTOR_DEPLOYMENT", "CORRECTOR_ENDPOINT", "CORRECTOR_API_KEY", "CORRECTOR_API", "CORRECTOR_REASONING_EFFORT",
     "CORRECTOR_MAX_OUTPUT_TOKENS", "CORRECTOR_TIMEOUT_SECONDS",
     "SERVICE_HOST", "SERVICE_PORT", "SERVICE_API_KEYS", "SERVICE_RETENTION_HOURS", "SERVICE_WORKERS",
@@ -192,6 +192,10 @@ def _looks_like_placeholder(value: str) -> bool:
 
 _TRUE, _FALSE = {"1", "true", "yes", "on"}, {"0", "false", "no", "off"}
 VALIDATED_THRESHOLD = 0.70      # the value the held-out test (2026-10-23) validated; changing it needs a new measurement
+# The languages Decision-1 has PASSED a held-out test for. Add "javascript" and "typescript" here only after
+# `python -m benchmark.classifier_eval --language javascript --heldout` says PASS (the record goes in benchmark/results/).
+VALIDATED_LANGUAGES = ("python",)
+CLASSIFIER_LANGUAGE_CHOICES = ("python", "javascript", "typescript")
 
 
 def _flag(environ: Mapping[str, str], name: str, default: bool, notes: list[str]) -> bool:
@@ -222,6 +226,7 @@ class Settings:
     classifier_enabled: bool = False
     classifier_required: bool = False
     classifier_threshold: float = VALIDATED_THRESHOLD
+    classifier_languages: tuple[str, ...] = ("python",)
     corrector_deployment: str = ""
     corrector_endpoint: str = ""        # empty = use FOUNDRY_ENDPOINT: Astra usually lives in the same Foundry resource as Decision-1
     corrector_api_key: str = ""         # secret; empty = use FOUNDRY_API_KEY
@@ -267,6 +272,21 @@ class Settings:
             notes.append(f"CLASSIFIER_THRESHOLD={threshold:g} is not the {VALIDATED_THRESHOLD:.2f} that the held-out test validated; "
                          "results at another threshold have not been measured")
 
+        languages: list[str] = []
+        for item in _text(environ, "CLASSIFIER_LANGUAGES", "python").lower().replace(";", ",").split(","):
+            item = item.strip()
+            if not item or item in languages:
+                continue
+            if item not in CLASSIFIER_LANGUAGE_CHOICES:
+                notes.append(f"CLASSIFIER_LANGUAGES has {item!r}, which Decision-1 has no questions for (choose from {', '.join(CLASSIFIER_LANGUAGE_CHOICES)}); ignored")
+            elif item not in VALIDATED_LANGUAGES:
+                notes.append(f"CLASSIFIER_LANGUAGES includes {item}, but Decision-1 has not passed its held-out test for {item}: its answers about {item} files are unmeasured")
+                languages.append(item)
+            else:
+                languages.append(item)
+        if not languages:
+            languages = ["python"]
+
         corrector_api = _text(environ, "CORRECTOR_API", "openai_v1").lower()
         if corrector_api not in ("openai_v1", "inference"):
             notes.append(f"CORRECTOR_API={corrector_api!r} is not openai_v1 or inference; using openai_v1")
@@ -295,6 +315,7 @@ class Settings:
             classifier_enabled=_flag(environ, "CLASSIFIER_ENABLED", False, notes),
             classifier_required=_flag(environ, "CLASSIFIER_REQUIRED", False, notes),
             classifier_threshold=threshold,
+            classifier_languages=tuple(languages),
             corrector_deployment=_text(environ, "CORRECTOR_DEPLOYMENT"),
             corrector_endpoint=normalize_endpoint(_text(environ, "CORRECTOR_ENDPOINT")) if _text(environ, "CORRECTOR_ENDPOINT") else "",
             corrector_api_key=_text(environ, "CORRECTOR_API_KEY"),
@@ -389,7 +410,7 @@ class Settings:
             f"callers ........... {ring.describe()}" if len(ring) else "callers ........... NONE (the service will not start)",
             f"submitted code kept {self.service_retention_hours} hours, in memory only; {self.service_workers} scans at a time; "
             f"{self.service_rate_limit_per_minute} requests per minute per caller; waits up to {self.service_max_wait_seconds} s",
-            "Decision-1 in scans: " + (f"ON at {self.classifier_threshold:.2f}" if self.classifier_enabled else "OFF (rules only)"),
+            "Decision-1 in scans: " + (f"ON at {self.classifier_threshold:.2f} for {', '.join(self.classifier_languages)}" if self.classifier_enabled else "OFF (rules only)"),
             ("Fixes: ON, by " + (self.corrector_deployment or "?") + f"; {self.service_fix_workers} at a time, {self.service_fix_rate_limit_per_minute} requests per minute per caller (each one costs a model call)")
             if self.service_fixes_enabled else "Fixes: OFF (answered with 501 until SERVICE_FIXES_ENABLED=true)",
         ]
@@ -439,10 +460,11 @@ class Settings:
             f"  model version .. {self.decision1_model_version}   (reported in results as Microsoft-Decision-1@{self.decision1_model_version})",
             f"  sign-in ........ {auth}",
             f"  timeout ........ {self.decision1_timeout:g} s per attempt, {self.decision1_max_attempts} attempts",
-            ("Decision-1 in scans: ON, at probability " + f"{self.classifier_threshold:.2f} or higher; "
+            ("Decision-1 in scans: ON for " + ", ".join(self.classifier_languages) + f", at probability {self.classifier_threshold:.2f} or higher; "
              + ("REQUIRED (if it is down, a scan that would pass becomes scan_failed)" if self.classifier_required
                 else "optional (if it is down, scans still finish on the rules and the report says so)"))
             if self.classifier_enabled else "Decision-1 in scans: OFF (scans use the rules only)",
+            _languages_line(),
             "Scan limits",
             f"  files .......... {self.scan_max_files} per request, {self.scan_max_file_bytes} bytes per file, {self.scan_max_total_bytes} bytes in total",
         ]
@@ -451,6 +473,14 @@ class Settings:
         lines.append("Problems: " + ("none (this does not prove the key or deployment name is right; run python -m tests.live_decision1)" if not problems else ""))
         lines += [f"  - {p}" for p in problems]
         return "\n".join(lines)
+
+
+def _languages_line() -> str:
+    """Which languages this installation can scan. JavaScript and TypeScript need the parser packages, so this depends on what is installed."""
+    from security_service.adapters.js_rules import available
+
+    return ("Languages: Python, JavaScript and TypeScript" if available()
+            else "Languages: Python only. JavaScript and TypeScript files are skipped (and can never pass) until you run:  pip install -r requirements.txt")
 
 
 def main(argv: list[str]) -> int:
@@ -566,12 +596,22 @@ def demo() -> None:
     # --- the classifier switches: off by default, parsed forgivingly, the validated threshold flagged when changed
     off = Settings.from_env(base)
     assert (off.classifier_enabled, off.classifier_required, off.classifier_threshold) == (False, False, 0.70) and off.warnings == ()
-    assert "Decision-1 in scans: OFF" in off.describe()
+    assert "Decision-1 in scans: OFF" in off.describe() and "Languages: " in off.describe()
+    assert off.classifier_languages == ("python",) and off.warnings == ()
     for raw, expected in (("true", True), ("TRUE", True), ("1", True), ("yes", True), ("on", True), ("false", False), ("0", False), ("off", False)):
         assert Settings.from_env({**base, "CLASSIFIER_ENABLED": raw}).classifier_enabled is expected, raw
     on = Settings.from_env({**base, "CLASSIFIER_ENABLED": "true", "CLASSIFIER_REQUIRED": "true"})
-    assert on.classifier_enabled and on.classifier_required and "ON, at probability 0.70" in on.describe() and "REQUIRED" in on.describe()
+    assert on.classifier_enabled and on.classifier_required and "ON for python, at probability 0.70" in on.describe() and "REQUIRED" in on.describe()
     assert "optional" in Settings.from_env({**base, "CLASSIFIER_ENABLED": "true"}).describe()
+    # which languages Decision-1 is asked about: python by default; javascript only when asked for, and then with a warning until it has passed its test
+    assert Settings.from_env({**base, "CLASSIFIER_LANGUAGES": "python"}).classifier_languages == ("python",)
+    js_on = Settings.from_env({**base, "CLASSIFIER_ENABLED": "true", "CLASSIFIER_LANGUAGES": "Python, JavaScript;typescript, javascript"})
+    assert js_on.classifier_languages == ("python", "javascript", "typescript") and len(js_on.warnings) == 2          # one warning per unvalidated language, no duplicates
+    assert all("has not passed its held-out test" in w for w in js_on.warnings) and "ON for python, javascript, typescript" in js_on.describe()
+    junk = Settings.from_env({**base, "CLASSIFIER_LANGUAGES": "cobol,python"})
+    assert junk.classifier_languages == ("python",) and len(junk.warnings) == 1 and "'cobol'" in junk.warnings[0]
+    assert Settings.from_env({**base, "CLASSIFIER_LANGUAGES": "cobol"}).classifier_languages == ("python",)           # nothing usable: back to the default
+    assert Settings.from_env({**base, "CLASSIFIER_LANGUAGES": " ,; "}).classifier_languages == ("python",)
     odd = Settings.from_env({**base, "CLASSIFIER_ENABLED": "maybe", "CLASSIFIER_THRESHOLD": "0.85"})
     assert odd.classifier_enabled is False and odd.classifier_threshold == 0.85 and len(odd.warnings) == 2
     assert any("not the 0.70" in w for w in odd.warnings)

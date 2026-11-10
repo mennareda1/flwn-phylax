@@ -36,7 +36,7 @@ def run(scanner: ScanService | None = None, cases: list[dict] | None = None) -> 
     scanner = scanner or ScanService()
     rows = []
     for case in cases or CASES:
-        report = scanner.scan_snippet(case["code"], "python")
+        report = scanner.scan_snippet(case["code"], case.get("language", "python"))
         types = {f.vulnerability_type for f in report.findings}
         rows.append({
             "case": case,

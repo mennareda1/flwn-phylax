@@ -31,6 +31,7 @@ from pathlib import Path
 from security_service.adapters.decision1 import Decision1Classifier
 from security_service.core.files import SourceFile
 from security_service.core.scan_service import ScanService
+from security_service import paths as paths_module
 from security_service.core.schema import Decision
 from security_service.config import REPO_ROOT, VARIABLES, Settings, load_env_file
 from security_service.ports.classifier import (
@@ -81,6 +82,15 @@ def astra_reply(body: dict, deployment: str) -> dict:
     user = next(m["content"] for m in body["messages"] if m["role"] == "user")
     ids = re.findall(r'<finding_[0-9a-f]+ id="(f\d+)"', user)
     shown = re.search(r'<file_[0-9a-f]+ path="[^"]*">\n(.*)\n</file_[0-9a-f]+>', user, re.S)
+    if shown and "exec(`ls ${dir}`);" in shown.group(1):                       # the JavaScript sample: swap the shell call for execFile
+        return {"model": "gpt-6-astra-2026-09-03", "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps({"edits": [
+            {"finding_ids": ids[:1], "old": 'const { exec } = require("child_process");\n', "new": 'const { execFile } = require("child_process");\n', "explanation": "Use execFile."},
+            {"finding_ids": ids[:1], "old": "  exec(`ls ${dir}`);\n", "new": ('  execFile("ls", [dir);\n' if deployment == "badjs" else '  execFile("ls", [dir]);\n'), "explanation": "Pass the argument as an array."}]})}}],
+            "usage": {"prompt_tokens": 520, "completion_tokens": 140, "completion_tokens_details": {"reasoning_tokens": 0}}}
+    if shown and "pool.query(`SELECT * FROM t WHERE id = ${id}`)" in shown.group(1):         # the TypeScript sample: placeholders
+        return {"model": "gpt-6-astra-2026-09-03", "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps({"edits": [
+            {"finding_ids": ids[:1], "old": "  return pool.query(`SELECT * FROM t WHERE id = ${id}`);\n", "new": '  return pool.query("SELECT * FROM t WHERE id = $1", [id]);\n', "explanation": "Use a placeholder."}]})}}],
+            "usage": {"prompt_tokens": 500, "completion_tokens": 120, "completion_tokens_details": {"reasoning_tokens": 0}}}
     if not shown or '\n    os.system("ping " + host)\n' not in "\n" + shown.group(1) + "\n":
         # what the real GPT-6 Astra answered when the file arrived as a tuple's text instead of source lines
         return {"model": "gpt-6-astra-2026-09-03", "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps(
@@ -262,6 +272,7 @@ def run() -> None:
 
         # 9. a .env file (Windows line endings, byte-order mark, comments) configures a real call end to end
         with tempfile.TemporaryDirectory() as folder:
+            paths_module.confine_git_root(Path(folder))          # a git folder above the temp folder must not change the labels
             env_path = Path(folder) / ".env"
             # the byte-order mark sits directly before the FIRST SETTING, exactly as Windows Notepad writes it
             env_path.write_bytes(("\ufeffFOUNDRY_ENDPOINT=" + full_url + "\r\n# Decision-1\r\nFOUNDRY_API_KEY=" + GOOD_KEY
@@ -360,6 +371,12 @@ def run() -> None:
             assert code == 2 and "nothing to ask the model to fix" in text
             code, text = contact("--sample", "nonsense")
             assert code == 2 and "Unknown sample" in text and len(server.requests) == before
+            code, text = contact("--sample", "js", CORRECTOR_DEPLOYMENT="badjs")                          # a JavaScript fix that does not parse is refused by the tool's own check
+            assert code == 1 and "CHECK failed: the patched file does not parse (syntax error near line" in text and "NOT usable" in text, text
+            for sample, expected_text in (("js", "execFile"), ("ts", '"SELECT * FROM t WHERE id = $1"')):
+                code, text = contact("--sample", sample)
+                assert code == 0 and "the fix is usable end to end" in text and expected_text in text, (sample, text)
+                assert "problem types before" in text and "still present at medium or above: none" in text and GOOD_KEY not in text
             code, text = contact(CORRECTOR_REASONING_EFFORT="none")                                    # a value Astra refuses is replaced, with a warning
             assert code == 0 and "warning: CORRECTOR_REASONING_EFFORT='none'" in text and server.requests[-1]["body"]["reasoning_effort"] == "low"
 
@@ -405,7 +422,21 @@ def run() -> None:
             assert sample_file.read_text(encoding="utf-8") == original_text
             code, text = repair(FOUNDRY_API_KEY="the-wrong-key-12345")
             assert code == 3 and "authentication failed" in text and "the-wrong-key-12345" not in text
-            assert repair("--finding", "f9")[0] == 4 and repair(CORRECTOR_DEPLOYMENT="")[0] == 4              # a bad id, and a missing setting, never reach the model
+            assert repair("--finding", "f9")[0] == 4 and repair(CORRECTOR_DEPLOYMENT="")[0] == 4
+
+            # the same command on JavaScript and TypeScript files: scanned by the JS rules, fixed, parsed with the right parser, saved, never applied
+            for name, sample_key in (("run.js", "js"), ("db.ts", "ts")):
+                target = Path(folder) / name
+                original_code = live_corrector.SAMPLES[sample_key].content
+                target.write_text(original_code, encoding="utf-8")
+                diff_file = Path(folder) / f"{name}.diff"
+                lines: list[str] = []
+                code = fix_tool.main([str(target), "--save-patch", str(diff_file)], environ={"FOUNDRY_ENDPOINT": full_url, "FOUNDRY_API_KEY": GOOD_KEY, "CORRECTOR_DEPLOYMENT": "gpt-6-astra"}, out=lines.append)
+                text = "\n".join(lines)
+                assert code == 0 and "VERIFICATION: passed" in text and "JavaScript/TypeScript file(s) parse; undefined names are not checked for them yet" in text, (name, text)
+                assert target.read_text(encoding="utf-8") == original_code and GOOD_KEY not in text                                    # never changed, nothing leaked
+                saved_patch = diff_file.read_text(encoding="utf-8")
+                assert saved_patch.startswith(f"--- a/{name}\n+++ b/{name}\n") and apply_unified_diff(original_code, saved_patch, name) != original_code              # a bad id, and a missing setting, never reach the model
 
             # 10. the program itself: `python -m tests.live_decision1` configured only by a .env file
             clean = {k: v for k, v in os.environ.items() if k not in VARIABLES}

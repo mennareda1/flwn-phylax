@@ -77,7 +77,31 @@ class PreparedFile:
     path: str
     content: str     # line endings normalized to \n so reported line numbers match the caller's
     language: str
+    sha256: str = ""  # of the text EXACTLY as submitted (before the normalization above), see sha256_text
 
+
+def sha256_text(text: str) -> str:
+    """SHA-256 (lowercase hex) of the text as UTF-8. This is the file "snapshot hash" Oqelira's apply_file_change compares
+    (`createHash('sha256').update(content).digest('hex')` on the exact file text), so a hash from Phylax and one from Oqelira agree
+    byte for byte. It is taken from the text as submitted, line endings included, never from the normalized copy."""
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def normalize_newlines(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def detect_eol(text: str) -> str:
+    """"\r\n" if EVERY line ends with CRLF (a Windows file), else "\n". A file with mixed endings is treated as LF: it comes back with LF."""
+    crlf = text.count("\r\n")
+    return "\r\n" if crlf and crlf == text.count("\n") and "\r" not in text.replace("\r\n", "") else "\n"
+
+
+def with_eol(text: str, eol: str) -> str:
+    """Give LF text the line endings of the file it came from."""
+    return text.replace("\n", "\r\n") if eol == "\r\n" else text
 
 def normalize_language(value: str | None) -> str | None:
     if value is None or not str(value).strip():
@@ -145,7 +169,7 @@ def prepare_files(
         elif language is None or language not in supported_languages:
             skipped.append(SkippedFile(path, "unsupported_language", is_source))
         else:
-            prepared.append(PreparedFile(path, content.replace("\r\n", "\n").replace("\r", "\n"), language))
+            prepared.append(PreparedFile(path, normalize_newlines(content), language, sha256_text(content)))
     return prepared, skipped
 
 
@@ -172,6 +196,15 @@ def demo() -> None:
     assert raises(InvalidScanInput, prep, [SourceFile("a.py", None)])
     assert raises(UnsupportedLanguage, prep, [SourceFile("a.cob", "x")], "cobol")
     assert raises(UnsupportedLanguage, prep, [SourceFile("a.js", "x")], "javascript")   # known but unsupported
+
+    # the snapshot hash is of the text exactly as submitted (CRLF included), never of the normalized copy; the scanned copy has LF only
+    crlf_text = "import os\r\nos.system(x)\r\n"
+    prepared_crlf, _ = prep([SourceFile("w.py", crlf_text)])
+    assert prepared_crlf[0].content == "import os\nos.system(x)\n" and prepared_crlf[0].sha256 == sha256_text(crlf_text) != sha256_text(prepared_crlf[0].content)
+    assert sha256_text("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" and sha256_text("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    assert sha256_text("caf\u00e9") == "850f7dc43910ff890f8879c0ed26fe697c93a067ad93a7d50f466a7028a9bf4e"                       # UTF-8, as the other side computes it
+    assert [detect_eol(t) for t in ("a\r\nb\r\n", "a\nb\n", "a\r\nb\n", "a\rb\r", "", "no newline", "a\r\nb\r\nc")] == ["\r\n", "\n", "\n", "\n", "\n", "\n", "\r\n"]
+    assert with_eol("a\nb\n", "\r\n") == "a\r\nb\r\n" and with_eol("a\nb\n", "\n") == "a\nb\n" and normalize_newlines(with_eol("a\nb\n", "\r\n")) == "a\nb\n"
 
     # language resolution: explicit file language > request language > extension; aliases normalized
     prepared, skipped = prep([SourceFile("a.py", "x = 1"), SourceFile("b", "y = 2", "PY")])

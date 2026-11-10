@@ -204,6 +204,11 @@ def run() -> None:
             assert len(sent) == 1 and len(sent[0]["body"]["questions"]) == 12              # exactly one model request, with the 12 questions
             assert KEY_FLWN not in json.dumps(sent) and KEY_VIEWER not in json.dumps(sent)  # the service's own keys never go to the model
 
+            # ---- JavaScript through the real process: the same service, a different language
+            status, js_scan, _ = request(base, "POST", "/v1/scans", KEY_FLWN, {"files": [{"path": "run.js", "content": 'const { exec } = require("child_process");\nexec(`ls ${dir}`);\n'}]}, {"Prefer": "wait=20"})
+            assert status == 200 and js_scan["report"]["decision"] == "block" and js_scan["report"]["findings"][0]["rule_id"] == "JS-EXEC"
+            assert {"id": "javascript", "roles": ["analyzer", "classifier"]} not in caps["languages"] and {"id": "javascript", "roles": ["analyzer"]} in caps["languages"]
+
             # ---- a retry is the same scan; a read-only key cannot create; nobody else can read it
             status, again, headers = request(base, "POST", "/v1/scans", KEY_FLWN, {"client_ref": "wi-9", "files": [{"path": "bad.py", "content": CODE}]},
                                              {"Prefer": "wait=20", "Idempotency-Key": "e2e-1"})
