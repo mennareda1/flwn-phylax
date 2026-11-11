@@ -10,8 +10,20 @@ import path from 'node:path';
 
 import { ChangeRefusedError } from './errors.js';
 
-/** The languages Phylax can scan today. */
+/** The code languages Phylax can scan today. */
 export const SOURCE_EXTENSIONS = ['.py', '.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx'] as const;
+
+/**
+ * Configuration and text files. Phylax checks them for hardcoded secrets ONLY, and every report says so (coverage.limited_scope). They are scanned, never corrected: a
+ * secret is not fixed by editing code, so no correction is ever proposed for one.
+ */
+export const CONFIG_EXTENSIONS = ['.json', '.yaml', '.yml', '.toml', '.ini', '.properties', '.config', '.txt'] as const;
+
+/** Lock files and generated files: large, written by a tool, never hold a secret worth finding. Matched by file name. */
+const GENERATED_NAMES = new Set([
+  'package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'composer.lock', 'pipfile.lock', 'poetry.lock', 'yarn.lock', 'bun.lock', 'cargo.lock',
+]);
+const GENERATED_ENDINGS = ['.min.json'];
 
 /** Folders that hold other people's code or build output. Hidden folders (starting with a dot) are skipped as well. */
 export const SKIP_FOLDERS = new Set([
@@ -27,6 +39,18 @@ const BLOCKED = /(^|\/)(\.git|\.oqelira|\.phylax|\.ssh|\.azure|\.aws|\.env(?!\.e
 export function isSourceFile(relativePath: string): boolean {
   const name = relativePath.toLowerCase();
   return SOURCE_EXTENSIONS.some((ext) => name.endsWith(ext)) && !NOT_SOURCE_ENDINGS.some((ending) => name.endsWith(ending));
+}
+
+/** A configuration or text file worth checking for secrets (not a lock file, not generated). */
+export function isConfigFile(relativePath: string): boolean {
+  const name = relativePath.toLowerCase();
+  const base = name.slice(name.lastIndexOf('/') + 1);
+  return CONFIG_EXTENSIONS.some((ext) => name.endsWith(ext)) && !GENERATED_NAMES.has(base) && !GENERATED_ENDINGS.some((ending) => name.endsWith(ending));
+}
+
+/** Everything a project scan sends: source code and configuration files. */
+export function isScannableFile(relativePath: string): boolean {
+  return isSourceFile(relativePath) || isConfigFile(relativePath);
 }
 
 export function isBlockedPath(relativePath: string): boolean {
@@ -88,7 +112,7 @@ export async function walkProject(root: string): Promise<string[]> {
       if (entry.isDirectory()) {
         if (SKIP_FOLDERS.has(entry.name) || entry.name.startsWith('.')) continue;
         await visit(path.join(directory, entry.name), relative);
-      } else if (entry.isFile() && isSourceFile(relative) && !isBlockedPath(relative)) {
+      } else if (entry.isFile() && isScannableFile(relative) && !isBlockedPath(relative)) {
         found.push(relative);
       }
     }

@@ -5,7 +5,7 @@ Scan files from the command line, with the engines your settings switch on, and 
 
     python -m security_service.scan app.py
     python -m security_service.scan src\\a.py src\\b.py
-    python -m security_service.scan src                  a whole folder: every .py file in it, except venv, .git, build and the like
+    python -m security_service.scan src                  a whole folder: every source file and configuration file in it, except venv, .git, build and the like
     python -m security_service.scan app.py --json        the full machine-readable report instead
 
 Settings come from your terminal and .env, as everywhere else (python -m security_service.config shows them). With
@@ -121,7 +121,7 @@ def demo() -> None:
         assert main([str(good), str(odd)], environ=off, out=say) == 0 and "notes.md (unsupported_language)" in "\n".join(shown)   # skipped files are listed
         shown.clear()
 
-        # a FOLDER: every .py file in it, junk folders skipped, files named relative to the folder, a long list of files summarized
+        # a FOLDER: every source and configuration file in it, junk folders skipped, files named relative to the folder, a long list of files summarized
         tree = Path(folder) / "project"
         (tree / "pkg").mkdir(parents=True)
         (tree / "venv").mkdir()

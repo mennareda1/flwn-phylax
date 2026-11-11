@@ -170,7 +170,7 @@ def run() -> None:
     check("Fix", as_fix(nothing))
     must_reject("Fix", {**as_fix(passing), "surprise": 1})                                                      # the contract is closed: unknown fields are errors
     must_reject("Fix", {**as_fix(nothing), "unfixed": [{"finding_id": "f1"}]})                                  # an unfixed entry needs its reason
-    assert {"id": "python", "roles": ["analyzer", "classifier"]} in with_model.capabilities()["languages"]
+    assert {"id": "python", "roles": ["analyzer", "classifier"], "scope": "full"} in with_model.capabilities()["languages"]
     check("Capabilities", service.capabilities())
     check("Readiness", {"status": "ready", "checks": {"analyzers": "ok"}})
 

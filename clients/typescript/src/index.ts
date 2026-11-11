@@ -10,6 +10,6 @@ export {
 } from './review.js';
 export { DiskFileChanger, sha256Text, type DiskFileChangerOptions } from './adapters/disk.js';
 export { OqeliraFileChanger, OQELIRA_MAX_CONTENT_CHARS, type OqeliraChangesModule, type OqeliraFileChangerOptions } from './adapters/oqelira.js';
-export { SOURCE_EXTENSIONS, SKIP_FOLDERS, isBlockedPath, isSourceFile, resolveInside, selectFiles, sortPaths, walkProject } from './project-files.js';
+export { SOURCE_EXTENSIONS, CONFIG_EXTENSIONS, SKIP_FOLDERS, isBlockedPath, isSourceFile, isConfigFile, isScannableFile, resolveInside, selectFiles, sortPaths, walkProject } from './project-files.js';
 export { formatSummary, formatProposal, formatOutcomes, formatVerification } from './format.js';
 export { createSecurityTools, type Consent, type SecurityTool, type SecurityTools, type SecurityToolsOptions, type ToolResult, type ToolRunContext } from './tools.js';

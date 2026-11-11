@@ -242,7 +242,7 @@ def check_smoke_patience() -> None:
     key = "k" * 43
     ready = (200, {"status": "ready", "checks": {"job_store": "ok", "analyzers": "ok"}})
     not_ready = (503, {"status": "not_ready", "checks": {"job_store": "ok", "analyzers": "failing"}})
-    capabilities = (200, {"contract_version": "1.3.0", "languages": [{"id": "python", "roles": ["analyzer"]}], "features": {"fixes": False, "verifications": True}})
+    capabilities = (200, {"contract_version": "1.4.0", "languages": [{"id": "python", "roles": ["analyzer"]}], "features": {"fixes": False, "verifications": True}})
     running = {"id": "scn_1", "status": "running", "report": None}
     done = {"id": "scn_1", "status": "completed", "report": {"decision": "block", "findings": [
         {"id": "f1", "vulnerability_type": "command_injection", "severity": "high", "fix": {"eligible": True, "reason": "Medium severity or above."}}]}}

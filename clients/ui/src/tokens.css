@@ -1,0 +1,21 @@
+:root {
+  /* base */
+  --cream: #F7F3EA; --white: #FFFFFF; --navy: #001F55; --ink: #14131A; --ink-soft: #6B6875;
+  /* pastel accents */
+  --pastel-green: #B3E3C4; --pastel-lavender: #E3D3FA; --pastel-gold: #F8DB99; --pastel-salmon: #F5B3AC; --pastel-blue: #ABE1EA;
+  /* derived neutrals */
+  --border: #E0DDD5; --dot: #D3CFC9; --ink-72: rgba(20, 19, 26, .72);
+  /* shape: only radii; circles 50%, pills 999px */
+  --r-sm: 0.375rem; --r: 0.625rem;
+  --shadow: 0 0.125rem 0 rgba(20,19,26,.06), 0 0.5rem 1.125rem rgba(20,19,26,.08);
+  /* spacing (rem, 1rem = 16px) */
+  --s-1: 0.25rem; --s-2: 0.5rem; --s-3: 0.75rem; --s-4: 1rem;
+  --s-5: 1.25rem; --s-6: 1.5rem; --s-8: 2rem; --s-10: 2.5rem;
+  --s-12: 3rem; --s-16: 4rem;
+  --max: 80rem; --measure: 42rem;
+  /* motion */
+  --dur-fast: 120ms; --dur: 200ms; --dur-slow: 320ms;
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1); --ease-in: cubic-bezier(0.55, 0, 1, 0.45); --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  /* hairlines stay px */
+  --line: 1.5px;
+}

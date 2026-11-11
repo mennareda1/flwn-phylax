@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Flwn security service API
-  version: 1.3.0
+  version: 1.4.0
   summary: Scan generated code for vulnerabilities, propose fixes, and verify them.
   description: |
     An independent service. It never imports Flwn code and never reads Flwn data. Flwn sends
@@ -577,6 +577,21 @@ components:
           type: array
           items: {type: string}
           description: Categories of problem that scanning submitted files cannot reveal.
+        limited_scope:
+          type: array
+          description: >-
+            Files that were checked for ONE thing only, so that a pass or a short list of findings is not read as more than it is. Today these are configuration and text files
+            (.json, .yaml, .yml, .toml, .ini, .properties, .config, .txt), which are checked for hardcoded secrets and nothing else. Every such file is also in files_scanned.
+          items: {$ref: '#/components/schemas/LimitedScope'}
+
+    LimitedScope:
+      type: object
+      additionalProperties: false
+      required: [path, language, checked_for]
+      properties:
+        path: {type: string}
+        language: {type: string}
+        checked_for: {type: string, description: 'What the file was checked for, for example "hardcoded secrets only".'}
 
     Engine:
       type: object
@@ -664,7 +679,7 @@ components:
               - vulnerabilities in third-party dependencies
               - deployment, configuration and runtime behavior
           provenance:
-            contract_version: 1.3.0
+            contract_version: 1.4.0
             service_version: 0.1.0
             policy_version: policy-1
             engines:
@@ -854,6 +869,12 @@ components:
         roles:
           type: array
           items: {type: string, enum: [analyzer, detector, classifier, corrector]}
+        scope:
+          type: string
+          enum: [full, secrets_only]
+          description: >-
+            "full": the language's own rules run on it. "secrets_only": configuration and text formats, which are checked for hardcoded secrets and nothing else
+            (the scan report lists those files under coverage.limited_scope).
 
     Capabilities:
       type: object
@@ -883,7 +904,7 @@ components:
             fixes: {type: boolean}
             verifications: {type: boolean}
       examples:
-        - contract_version: 1.3.0
+        - contract_version: 1.4.0
           service_version: 0.1.0
           policy_version: policy-1
           languages:

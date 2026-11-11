@@ -4,10 +4,12 @@ security_service/paths.py
 What a person types on the command line, turned into the files to scan and the names to call them.
 
   - A FILE is used as given, whatever its extension (an unsupported one is then reported as skipped, not hidden).
-  - A FOLDER is searched recursively for the source files Phylax can scan (.py .js .jsx .mjs .cjs .ts .tsx), skipping the folders that
+  - A FOLDER is searched recursively for the files Phylax can scan: source code (.py .js .jsx .mjs .cjs .ts .tsx) and configuration and text files (.json .yaml .yml .toml .ini
+    .properties .config .txt, checked for hardcoded secrets ONLY), skipping the folders that
     hold other people's code or build output (.git, venv, node_modules, site-packages, vendor, build, dist, .next, coverage and the like;
     hidden folders too) and the files that are not source anyone writes: minified or bundled code (*.min.js, *.bundle.js) and TypeScript
-    declaration files (*.d.ts). A file you name yourself is always used, whatever it is.
+    declaration files (*.d.ts), lock files and minified JSON (package-lock.json, pnpm-lock.yaml, *.min.json and the like), and files that are protected by name (.env files, keys:
+    *.pem *.key *.pfx *.p12). A file you name yourself is always used, whatever it is.
   - Every file gets a LABEL, the path shown in reports and written into patches, chosen so that `git apply` works:
         1. relative to the folder you are standing in, when the file is inside it (the normal case);
         2. otherwise relative to the root of the git repository the file belongs to, when it has one;
@@ -29,11 +31,29 @@ SKIP_FOLDERS = {".git", ".hg", ".svn", "venv", ".venv", "env", "__pycache__", "n
                 "vendor", "vendors", "third_party", "bower_components", ".next", ".nuxt", "coverage", ".turbo", ".cache", ".parcel-cache", ".svelte-kit"}
 SOURCE_SUFFIXES = (".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx")
 NOT_SOURCE_ENDINGS = (".min.js", ".min.mjs", ".min.cjs", ".bundle.js", ".d.ts", ".d.mts", ".d.cts")
+# Configuration and text files: checked for hardcoded secrets only (the report says so). The same rules as the TypeScript client (clients/typescript/src/project-files.ts).
+CONFIG_SUFFIXES = (".json", ".yaml", ".yml", ".toml", ".ini", ".properties", ".config", ".txt")
+GENERATED_NAMES = {"package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "composer.lock", "pipfile.lock", "poetry.lock", "yarn.lock", "bun.lock", "cargo.lock"}
+GENERATED_ENDINGS = (".min.json",)
+PROTECTED_ENDINGS = (".pem", ".key", ".pfx", ".p12")
+
+
+def _is_protected(name: str) -> bool:
+    """Environment files and keys are never picked up by a folder scan, whatever their extension (a .env.json is still an environment file)."""
+    return (name.startswith(".env") and not name.startswith(".env.example")) or name.endswith(PROTECTED_ENDINGS)
 
 
 def _is_source(path: Path) -> bool:
     name = path.name.lower()
     return name.endswith(SOURCE_SUFFIXES) and not name.endswith(NOT_SOURCE_ENDINGS)
+
+
+def _is_scannable(path: Path) -> bool:
+    """Source code, or a configuration or text file that is neither generated nor protected."""
+    name = path.name.lower()
+    if _is_protected(name):
+        return False
+    return _is_source(path) or (name.endswith(CONFIG_SUFFIXES) and name not in GENERATED_NAMES and not name.endswith(GENERATED_ENDINGS))
 
 
 class PathProblem(Exception):
@@ -95,7 +115,7 @@ def expand(arguments: list[str], cwd: Path | None = None) -> list[tuple[Path, st
             raise PathProblem(f"Cannot read {argument}: {problem.strerror or problem}") from None
         if resolved.is_dir():
             inside = _ordered([p for p in resolved.rglob("*")
-                               if p.is_file() and _is_source(p) and not any(part in SKIP_FOLDERS or (part.startswith(".") and part not in (".", "..")) for part in p.relative_to(resolved).parts[:-1])])
+                               if p.is_file() and _is_scannable(p) and not any(part in SKIP_FOLDERS or (part.startswith(".") and part not in (".", "..")) for part in p.relative_to(resolved).parts[:-1])])
             if not inside:
                 raise PathProblem(f"No source files that Phylax can scan (Python, JavaScript, TypeScript) were found in {argument} (folders such as .git, venv, node_modules, vendor and build are skipped)")
             found.extend(inside)
@@ -169,10 +189,15 @@ def demo() -> None:
         # a JavaScript and TypeScript project: source files are found; minified bundles, declaration files, vendor and build folders are not
         web = root / "web"
         for name in ("src/index.ts", "src/App.tsx", "src/util.js", "src/lib.mjs", "src/legacy.cjs", "src/Widget.jsx", "src/types.d.ts", "src/app.min.js", "src/app.bundle.js",
-                     "vendor/jquery.js", "dist/main.js", "build/out.js", "node_modules/x/index.js", ".next/server/page.js", "coverage/lcov.js", "public/vendor/lib.js", "README.md", "package.json"):
+                     "vendor/jquery.js", "dist/main.js", "build/out.js", "node_modules/x/index.js", ".next/server/page.js", "coverage/lcov.js", "public/vendor/lib.js", "README.md", "package.json",
+                     # configuration and text files are scanned for secrets; lock files, minified json, environment files and keys never are
+                     "config/app.yaml", "config/app.yml", "settings.toml", "conf/db.ini", "db.properties", "web.config", "notes.txt", "config/prod.json",
+                     "package-lock.json", "pnpm-lock.yaml", "static/bundle.min.json", ".env.json", ".env.local", "secrets/server.key", "dist/c.json", "node_modules/x/c.json", ".hidden/h.json"):
             (web / name).parent.mkdir(parents=True, exist_ok=True)
             (web / name).write_text("x = 1\n", encoding="utf-8")
-        assert [label for _, label in expand(["web"], cwd=root)] == ["web/src/App.tsx", "web/src/Widget.jsx", "web/src/index.ts", "web/src/legacy.cjs", "web/src/lib.mjs", "web/src/util.js"]
+        assert [label for _, label in expand(["web"], cwd=root)] == [
+            "web/conf/db.ini", "web/config/app.yaml", "web/config/app.yml", "web/config/prod.json", "web/db.properties", "web/notes.txt", "web/package.json", "web/settings.toml",
+            "web/src/App.tsx", "web/src/Widget.jsx", "web/src/index.ts", "web/src/legacy.cjs", "web/src/lib.mjs", "web/src/util.js", "web/web.config"]
         assert [label for _, label in expand(["web/dist/main.js", "web/src/app.min.js", "web/src/types.d.ts"], cwd=root)] == ["web/dist/main.js", "web/src/app.min.js", "web/src/types.d.ts"]   # named files are always used
 
         # standing in the folder: labels are relative to it, with forward slashes, in sorted order

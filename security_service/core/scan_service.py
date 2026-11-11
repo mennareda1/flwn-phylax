@@ -26,6 +26,7 @@ from security_service.core.files import (
     InvalidScanInput,
     Limits,
     PayloadTooLarge,
+    SECRETS_ONLY_LANGUAGES,
     SourceFile,
     UnsupportedLanguage,
     prepare_files,
@@ -121,9 +122,10 @@ def _skipped_note(skipped: list[SkippedFile]) -> tuple[str, ...]:
 
 def default_analyzers() -> list:
     """The always-on engines: Bandit for Python, the secrets check, and our JavaScript and TypeScript rules when their parser packages are
-    installed. The secrets check covers a language only if a rules engine covers it too, so a file never counts as scanned on secrets alone."""
+    installed. In CODE the secrets check covers a language only if a rules engine covers it too, so a code file never counts as scanned on secrets alone. Configuration and text
+    files (SECRETS_ONLY_LANGUAGES) are the one deliberate exception: the secrets check is their only engine, and every report says so (coverage.limited_scope)."""
     languages = ("python", "javascript", "typescript") if js_available() else ("python",)
-    analyzers: list = [BanditAnalyzer(), SecretsAnalyzer(languages)]
+    analyzers: list = [BanditAnalyzer(), SecretsAnalyzer(languages, config_languages=tuple(sorted(SECRETS_ONLY_LANGUAGES)))]
     if js_available():
         analyzers.append(JsRulesAnalyzer())
     return analyzers
@@ -177,7 +179,7 @@ class ScanService:
             "contract_version": CONTRACT_VERSION,
             "service_version": SERVICE_VERSION,
             "policy_version": POLICY_VERSION,
-            "languages": [{"id": lang, "roles": sorted(r)} for lang, r in sorted(roles.items())],
+            "languages": [{"id": lang, "roles": sorted(r), "scope": "secrets_only" if lang in SECRETS_ONLY_LANGUAGES else "full"} for lang, r in sorted(roles.items())],
             "limits": {
                 "max_files": self._limits.max_files,
                 "max_file_bytes": self._limits.max_file_bytes,
@@ -202,6 +204,10 @@ class ScanService:
         prepared, skipped = prepare_files(files, language, self.supported_languages, self._limits)
         skipped_blocking = sum(1 for s in skipped if s.blocks_pass)
         notes = _skipped_note(skipped)
+        limited = [{"path": f.path, "language": f.language, "checked_for": "hardcoded secrets only"} for f in prepared if f.language in SECRETS_ONLY_LANGUAGES]
+        if limited:                                  # a configuration file is checked for secrets and nothing else: the verdict must not read as more than that
+            shown = ", ".join(item["path"] for item in limited[:5]) + (f" and {len(limited) - 5} more" if len(limited) > 5 else "")
+            notes = notes + (f"{len(limited)} configuration or text file(s) were checked for hardcoded secrets only ({shown}).",)
 
         findings: list[Finding] = []
         analyzers_ok: set[str] = set()
@@ -263,6 +269,7 @@ class ScanService:
                 skipped_files=skipped,
                 analyzers_run=sorted(analyzers_ok),
                 analyzers_failed=analyzers_failed,
+                limited_scope=limited,
             ),
             provenance=Provenance(
                 CONTRACT_VERSION, SERVICE_VERSION, POLICY_VERSION,
@@ -483,8 +490,8 @@ def demo() -> None:
     detector = configured._analyzers[-1]
     assert [a.name for a in configured._analyzers] == ["bandit", "secrets", "jsrules", "stand-in"] and detector.threshold == 0.8 and detector.required is True
     assert configured.limits.max_files == 7
-    assert {"id": "python", "roles": ["analyzer", "classifier"]} in configured.capabilities()["languages"]
-    assert {"id": "javascript", "roles": ["analyzer"]} in configured.capabilities()["languages"] and detector.languages == ("python",)     # JavaScript is not asked until it has passed its test
+    assert {"id": "python", "roles": ["analyzer", "classifier"], "scope": "full"} in configured.capabilities()["languages"]
+    assert {"id": "javascript", "roles": ["analyzer"], "scope": "full"} in configured.capabilities()["languages"] and detector.languages == ("python",)     # JavaScript is not asked until it has passed its test
 
     # Decision-1 on JavaScript: only when CLASSIFIER_LANGUAGES says so; then it can flag what the rules cannot see, as a review (never a block)
     sh_c = SourceFile("run.js", "const { spawn } = require('child_process');\nspawn('sh', ['-c', 'convert ' + file + ' out.png']);\n")
@@ -492,7 +499,7 @@ def demo() -> None:
     off_for_js = ScanService.from_settings(Settings.from_env(on_env), classifier=suspicious).scan([sh_c])
     assert off_for_js.decision == Decision.PASS and off_for_js.findings == []                                                    # the rules cannot see sh -c, and the model is not asked
     on_for_js = ScanService.from_settings(Settings.from_env({**on_env, "CLASSIFIER_LANGUAGES": "python,javascript"}), classifier=suspicious)
-    assert {"id": "javascript", "roles": ["analyzer", "classifier"]} in on_for_js.capabilities()["languages"]
+    assert {"id": "javascript", "roles": ["analyzer", "classifier"], "scope": "full"} in on_for_js.capabilities()["languages"]
     flagged = on_for_js.scan([sh_c])
     assert flagged.decision == Decision.REVIEW_REQUIRED and [f.vulnerability_type for f in flagged.findings] == ["command_injection"]
     assert flagged.findings[0].evidence_tier.value == "model_suspicion" and "execFile" in flagged.findings[0].recommendation and flagged.findings[0].line is None
@@ -554,14 +561,14 @@ def demo() -> None:
     mixed = real.scan([SourceFile("a.py", "import os\nos.system(cmd)\n"), SourceFile("b.js", "eval(x);\n"), SourceFile("c.ts", "const n: number = 1;\n"), SourceFile("d.go", "package main\n")])
     assert {f.path for f in mixed.findings} == {"a.py", "b.js"} and mixed.coverage.languages == ["javascript", "python", "typescript"]
     assert [s.path for s in mixed.coverage.skipped_files] == ["d.go"] and mixed.decision == Decision.BLOCK                                # a language with no engine is still skipped, and says so
-    assert {"id": "javascript", "roles": ["analyzer"]} in real.capabilities()["languages"] and {"id": "typescript", "roles": ["analyzer"]} in real.capabilities()["languages"]
+    assert {"id": "javascript", "roles": ["analyzer"], "scope": "full"} in real.capabilities()["languages"] and {"id": "typescript", "roles": ["analyzer"], "scope": "full"} in real.capabilities()["languages"]
     no_js = ScanService([BanditAnalyzer(), SecretsAnalyzer()])
     skipped_js = no_js.scan([SourceFile("x.js", "eval(y);\n")])                                                                          # without the JavaScript engine, a .js file can never pass
     assert skipped_js.decision == Decision.REVIEW_REQUIRED and skipped_js.coverage.skipped_files[0].reason == "unsupported_language" and skipped_js.coverage.skipped_files[0].blocks_pass
 
     # capabilities reflect the configured engines
     caps = ScanService([_StubAnalyzer("stub")]).capabilities()
-    assert caps["languages"] == [{"id": "python", "roles": ["analyzer"]}] and caps["limits"]["max_files"] == 50
+    assert caps["languages"] == [{"id": "python", "roles": ["analyzer"], "scope": "full"}] and caps["limits"]["max_files"] == 50
 
     # CRLF input keeps line numbers aligned; report is JSON-serializable
     crlf = two.scan([SourceFile("a.py", "a\r\nb\r\nc")])
@@ -570,7 +577,29 @@ def demo() -> None:
     assert set(payload) == {"status", "decision", "risk_level", "findings", "summary", "decision_reasons",
                             "coverage", "provenance", "duration_ms"}
 
-    print("core.scan_service OK: multi-file scan, skips, corroboration, fail-closed paths, JSON report")
+    # configuration and text files: checked for hardcoded secrets ONLY, and the report says so, in a field and in words
+    engines = ScanService()
+    plain = engines.scan([SourceFile("config/app.yaml", "name: app\nport: 8080\n"), SourceFile("notes.txt", "see the wiki\n")])
+    assert plain.decision == Decision.PASS and plain.coverage.files_scanned == ["config/app.yaml", "notes.txt"] and plain.coverage.languages == ["text", "yaml"]
+    assert [(i["path"], i["language"], i["checked_for"]) for i in plain.coverage.limited_scope] == [("config/app.yaml", "yaml", "hardcoded secrets only"), ("notes.txt", "text", "hardcoded secrets only")]
+    assert any("checked for hardcoded secrets only" in reason for reason in plain.decision_reasons) and "not a guarantee" in " ".join(plain.decision_reasons)
+    leaky = engines.scan([SourceFile("config/app.yaml", "db:\n  password: hunter2secret\n")])
+    assert leaky.decision == Decision.REVIEW_REQUIRED and [(f.vulnerability_type, f.line, f.rule_id) for f in leaky.findings] == [("hardcoded_credentials", 2, "SECRET-CONFIG")]
+    assert "hunter2secret" not in json.dumps(leaky.to_dict()), "an unquoted secret must not appear anywhere in the report"
+    known = engines.scan([SourceFile("settings.json", '{"aws": "AKIAIOSFODNN7EXAMPLE"}')])
+    assert known.decision == Decision.REVIEW_REQUIRED and known.findings[0].severity == Severity.HIGH and known.findings[0].confidence == Confidence.MEDIUM   # high severity, but a pattern never blocks
+    mixed = engines.scan([SourceFile("a.py", "import os\nos.system('ls ' + x)\n"), SourceFile("c.yaml", "p: 1\n")])
+    assert mixed.decision == Decision.BLOCK and [i["path"] for i in mixed.coverage.limited_scope] == ["c.yaml"]
+    code_only = engines.scan([SourceFile("a.py", "x = 1\n")])
+    assert code_only.decision == Decision.PASS and code_only.coverage.limited_scope == [] and not any("hardcoded secrets only" in r for r in code_only.decision_reasons)
+    tight = ScanService(default_analyzers(), limits=Limits(max_file_bytes=60))
+    big = tight.scan([SourceFile("data.json", '{"a": "' + "x" * 100 + '"}'), SourceFile("layout.xml", "<a/>\n")])
+    assert [(sk.path, sk.reason, sk.blocks_pass) for sk in big.coverage.skipped_files] == [("data.json", "file_too_large", False), ("layout.xml", "unsupported_language", False)]
+    assert big.decision == Decision.PASS and "nothing was checked" in " ".join(big.decision_reasons)      # listed, never silent; configuration is not source, so it does not block
+    assert {"id": "yaml", "roles": ["analyzer"], "scope": "secrets_only"} in engines.capabilities()["languages"] and all(l["scope"] in ("full", "secrets_only") for l in engines.capabilities()["languages"])
+    assert {"json", "yaml", "toml", "ini", "properties", "config", "text"} <= engines.supported_languages
+
+    print("core.scan_service OK: multi-file scan, skips, corroboration, fail-closed paths, JSON report, configuration files checked for secrets only and said so")
 
 
 if __name__ == "__main__":

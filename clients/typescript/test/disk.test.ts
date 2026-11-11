@@ -74,11 +74,17 @@ test('paths can never leave the project or reach protected files', async () => {
 test('listFiles walks the project like the Python tool: skips other people\'s code, build output and minified files, in a stable order', async () => {
   const names = ['src/index.ts', 'src/App.tsx', 'src/util.js', 'src/lib.mjs', 'src/legacy.cjs', 'src/Widget.jsx', 'app.py', 'README.md', 'package.json',
     'src/types.d.ts', 'src/app.min.js', 'src/app.bundle.js', 'node_modules/x/index.js', 'vendor/jquery.js', 'dist/main.js', 'build/o.js', '.next/page.js', 'coverage/c.js', '.hidden/h.js', '.env', 'key.pem',
-    '.env.js', '.env.local.ts'];                                          // protected names are never listed, even when their extension is a source one
+    '.env.js', '.env.local.ts',                                           // protected names are never listed, even when their extension is a source one
+    'config/app.yaml', 'config/app.yml', 'settings.toml', 'conf/db.ini', 'db.properties', 'web.config', 'notes.txt', 'config/prod.json',        // configuration and text files: checked for secrets
+    'package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'static/bundle.min.json', 'tsconfig.tsbuildinfo', 'app.js.map',                // lock files and generated files: never
+    'node_modules/x/config.json', 'dist/c.json', 'vendor/v.yaml', '.hidden/h.json', '.env.json', '.aws/credentials.json', 'secrets.pem.txt.key'];  // other people's folders and protected names: never
   const project = await tempProject(Object.fromEntries(names.map((n) => [n, 'x = 1\n'])));
   try {
     const host = new DiskFileChanger(project.root);
-    assert.deepEqual(await host.listFiles({ kind: 'project' }), ['app.py', 'src/App.tsx', 'src/Widget.jsx', 'src/index.ts', 'src/legacy.cjs', 'src/lib.mjs', 'src/util.js']);
+    assert.deepEqual(await host.listFiles({ kind: 'project' }), [
+      'app.py', 'conf/db.ini', 'config/app.yaml', 'config/app.yml', 'config/prod.json', 'db.properties', 'notes.txt', 'package.json', 'settings.toml',
+      'src/App.tsx', 'src/Widget.jsx', 'src/index.ts', 'src/legacy.cjs', 'src/lib.mjs', 'src/util.js', 'web.config',
+    ], 'source code and configuration files, in a stable order; lock files, generated files, other people\'s folders and protected names are not listed');
     assert.deepEqual(await host.listFiles({ kind: 'files', paths: ['src/util.js', 'app.py', 'src/util.js', 'src\\util.js'] }), ['app.py', 'src/util.js'], 'chosen files are de-duplicated and sorted');
     assert.deepEqual(await host.listFiles({ kind: 'files', paths: ['README.md', 'dist/main.js'] }), ['README.md', 'dist/main.js'], 'a file you name yourself is always used');
     await assert.rejects(host.listFiles({ kind: 'files', paths: ['nope.js'] }), /does not exist/);

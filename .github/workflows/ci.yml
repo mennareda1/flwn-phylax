@@ -34,5 +34,9 @@ jobs:
         run: npm ci
         working-directory: clients/typescript
 
+      - name: Install the UI's packages
+        run: npm ci
+        working-directory: clients/ui
+
       - name: Run every check
         run: python -m tests.run_all

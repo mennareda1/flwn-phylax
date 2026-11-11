@@ -193,7 +193,7 @@ def run() -> None:
         assert r.headers["www-authenticate"] == "Bearer" and r.json()["code"] == "unauthorized"
         caps = call(client, "GET", "/v1/capabilities", expect=200, key=KEY_BOB).json()                     # any valid key, even read-only
         assert caps["features"] == {"fixes": False, "verifications": True} and caps["limits"]["max_files"] == 5 and caps["limits"]["max_wait_seconds"] == 10
-        assert caps["contract_version"] == spec["info"]["version"] == "1.3.0"
+        assert caps["contract_version"] == spec["info"]["version"] == "1.4.0"
 
         # ---------------------------------------------------------------- authentication, scopes, and the order of the checks
         for label, headers in (("a wrong key", auth("wrong-key-wrong-key-wrong-key-1")), ("no key", {}), ("basic auth", {"Authorization": f"Basic {KEY_ALICE}"}),
@@ -397,7 +397,7 @@ def run() -> None:
         assert report["decision"] == "review_required" and report["findings"][0]["evidence_tier"] == "model_suspicion" and report["findings"][0]["line"] is None
         assert {"role": "classifier", "name": "stand-in-model"} in report["provenance"]["engines"]
         caps = call(client, "GET", "/v1/capabilities", expect=200, key=KEY_ALICE).json()
-        assert {"id": "python", "roles": ["analyzer", "classifier"]} in caps["languages"]
+        assert {"id": "python", "roles": ["analyzer", "classifier"], "scope": "full"} in caps["languages"]
     finally:
         gateway.shutdown()
 
@@ -629,7 +629,7 @@ def run() -> None:
     client = TestClient(app, raise_server_exceptions=False)
     try:
         caps = call(client, "GET", "/v1/capabilities", expect=200, key=KEY_ALICE).json()
-        assert {"id": "javascript", "roles": ["analyzer"]} in caps["languages"] and {"id": "typescript", "roles": ["analyzer"]} in caps["languages"] and {"id": "python", "roles": ["analyzer"]} in caps["languages"]
+        assert {"id": "javascript", "roles": ["analyzer"], "scope": "full"} in caps["languages"] and {"id": "typescript", "roles": ["analyzer"], "scope": "full"} in caps["languages"] and {"id": "python", "roles": ["analyzer"], "scope": "full"} in caps["languages"]
         wait = {"Prefer": "wait=20"}
         js_code = 'const { exec } = require("child_process");\n// ' + CANARY + '\nfunction run(dir) {\n  exec(`ls ${dir}`);\n}\n'
         scan = call(client, "POST", "/v1/scans", expect=200, key=KEY_ALICE, headers=wait, body={"files": [{"path": "src/run.js", "content": js_code}]}).json()
@@ -650,6 +650,24 @@ def run() -> None:
         assert "JavaScript/TypeScript file(s) parse; undefined names are not checked" in next(c["detail"] for c in verified["checks"] if c["name"] == "syntax")
         unparsable = call(client, "POST", "/v1/verifications", expect=200, key=KEY_ALICE, headers=wait, body={"scan_id": scan["id"], "files": [{"path": "src/run.js", "content": fixed_js.replace("[dir]", "[dir")}]}).json()
         assert unparsable["outcome"] == "failed" and next(c for c in unparsable["checks"] if c["name"] == "syntax")["result"] == "fail"
+
+        # configuration files over HTTP: checked for hardcoded secrets ONLY, and the response says so (every response here is validated against the contract)
+        assert {"id": "yaml", "roles": ["analyzer"], "scope": "secrets_only"} in caps["languages"] and {"id": "text", "roles": ["analyzer"], "scope": "secrets_only"} in caps["languages"]
+        cfg = call(client, "POST", "/v1/scans", expect=200, key=KEY_ALICE, headers=wait, body={"files": [
+            {"path": "config/app.yaml", "content": "db:\n  user: app\n  password: hunter2secret\n"},
+            {"path": "settings.json", "content": '{"port": 8080}\n'},
+            {"path": "layout.xml", "content": "<a/>\n"}]}).json()
+        report = cfg["report"]
+        assert report["decision"] == "review_required" and [(f["path"], f["rule_id"], f["line"]) for f in report["findings"]] == [("config/app.yaml", "SECRET-CONFIG", 3)]
+        assert report["coverage"]["languages"] == ["json", "yaml"] and report["coverage"]["limited_scope"] == [
+            {"path": "config/app.yaml", "language": "yaml", "checked_for": "hardcoded secrets only"},
+            {"path": "settings.json", "language": "json", "checked_for": "hardcoded secrets only"}]
+        assert [(sk["path"], sk["blocks_pass"]) for sk in report["coverage"]["skipped_files"]] == [("layout.xml", False)]       # listed, never silent; not source, so it does not block
+        assert any("hardcoded secrets only" in reason for reason in report["decision_reasons"])
+        assert report["findings"][0]["fix"]["eligible"] is False                                                                   # a secret is never corrected by editing code
+        assert "hunter2secret" not in json.dumps(cfg), "an unquoted secret must not appear anywhere in the response"
+        clean_cfg = call(client, "POST", "/v1/scans", expect=200, key=KEY_ALICE, headers=wait, body={"files": [{"path": "app.toml", "content": 'password = "${DB_PASSWORD}"\nport = 8080\n'}]}).json()
+        assert clean_cfg["report"]["decision"] == "pass" and clean_cfg["report"]["coverage"]["limited_scope"][0]["checked_for"] == "hardcoded secrets only"      # a reference is not a secret, yet the pass still says what it covered
     finally:
         gateway.shutdown()
 

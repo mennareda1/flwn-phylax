@@ -22,7 +22,7 @@ export function finding(id: string, path: string, severity: Severity, type = 'co
 }
 
 export const CAPABILITIES: Capabilities = {
-  contract_version: '1.3.0', languages: [{ id: 'javascript', roles: ['analyzer'] }], retention_hours: 24, features: { fixes: true, verifications: true },
+  contract_version: '1.4.0', languages: [{ id: 'javascript', roles: ['analyzer'] }], retention_hours: 24, features: { fixes: true, verifications: true },
   limits: { max_files: 50, max_file_bytes: 200_000, max_total_bytes: 1_000_000, max_wait_seconds: 30 },
 };
 

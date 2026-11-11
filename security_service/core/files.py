@@ -26,13 +26,22 @@ LANGUAGE_ALIASES = {
     "ts": "typescript",
     "c++": "cpp", "cxx": "cpp",
     "c#": "csharp", "cs": "csharp",
+    "yml": "yaml", "txt": "text",
 }
 
 KNOWN_CODE_LANGUAGES = frozenset(
     {"python", "javascript", "typescript", "cpp", "c", "csharp", "java", "go", "rust", "ruby", "php", "shell"}
 )
 
+# Configuration and text files. They are scanned for hardcoded secrets ONLY (core/config_secrets.py), and the report says so (coverage.limited_scope). They are not source
+# code, so one that cannot be scanned (too large, binary) is listed but does not block a pass.
+CONFIG_EXTENSION_LANGUAGES = {
+    ".json": "json", ".yaml": "yaml", ".yml": "yaml", ".properties": "properties", ".toml": "toml", ".ini": "ini", ".config": "config", ".txt": "text",
+}
+SECRETS_ONLY_LANGUAGES = frozenset(CONFIG_EXTENSION_LANGUAGES.values())
+
 EXTENSION_LANGUAGES = {
+    **CONFIG_EXTENSION_LANGUAGES,
     ".py": "python", ".pyi": "python",
     ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript", ".jsx": "javascript",
     ".ts": "typescript", ".tsx": "typescript",

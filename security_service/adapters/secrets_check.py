@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import time
 
+from security_service.core.config_secrets import scan_config
 from security_service.core.redaction import SecretHit, mask_for_report, scan_secrets
 from security_service.core.schema import (
     RECOMMENDATIONS,
@@ -41,6 +42,10 @@ _DESCRIPTIONS = {
     "known_token": ("SECRET-TOKEN", "A value in the format of a live access key or token is written into the source."),
     "bearer_token": ("SECRET-TOKEN", "A value in the format of a live access key or token is written into the source."),
     "credential_assignment": ("SECRET-ASSIGN", "A value that looks like a real secret is assigned to a credential-named variable."),
+    # configuration and text files (core/config_secrets.py)
+    "config_credential": ("SECRET-CONFIG", "A value that looks like a real secret is set for a credential-named key."),
+    "url_credential": ("SECRET-URL", "A password is written into a connection URL."),
+    "connection_string": ("SECRET-CONNSTR", "A password is written into a connection string."),
 }
 
 
@@ -55,14 +60,18 @@ class SecretsAnalyzer:
     role = "analyzer"
     name = "secrets"
 
-    def __init__(self, languages: tuple[str, ...] = ("python",)):
-        """The languages it covers. Widen this only together with a rules engine for the same language (see the module note)."""
-        self.languages = languages
+    def __init__(self, languages: tuple[str, ...] = ("python",), config_languages: tuple[str, ...] = ()):
+        """`languages` are code languages: widen them only together with a rules engine for the same language (see the module note).
+        `config_languages` are configuration and text formats, which this check alone covers on purpose, for secrets only; the scan service says so in the report."""
+        self.languages = tuple(languages) + tuple(lang for lang in config_languages if lang not in languages)
+        self._config_languages = frozenset(config_languages)
 
     def analyze(self, code: str, language: str) -> AnalyzerResult:
         started = time.monotonic()
         if language not in self.languages:
             return AnalyzerResult(analyzer=self.name, error=f"secrets check does not support language {language!r}")
+        if language in self._config_languages:
+            return self._analyze_config(code, started)
 
         lines = code.split("\n")
         strict_hits: dict[int, list[SecretHit]] = {}
@@ -84,6 +93,26 @@ class SecretsAnalyzer:
                 cwe="CWE-798",
                 line=number,
                 evidence=mask_for_report(lines[number - 1].strip(), "hardcoded_credentials")[:200],
+                description=description,
+                recommendation=RECOMMENDATIONS["hardcoded_credentials"],
+            ))
+        return AnalyzerResult(analyzer=self.name, findings=findings, duration_ms=int((time.monotonic() - started) * 1000))
+
+
+    def _analyze_config(self, text: str, started: float) -> AnalyzerResult:
+        findings = []
+        for hit in scan_config(text):
+            rule_id, description = _DESCRIPTIONS[hit.kind]
+            findings.append(Finding(
+                vulnerability_type="hardcoded_credentials",
+                severity=Severity.HIGH if hit.kind in _KNOWN_KINDS else Severity.MEDIUM,
+                confidence=Confidence.MEDIUM,
+                evidence_tier=EvidenceTier.STATIC_RULE,
+                sources=[self.name],
+                rule_id=rule_id,
+                cwe="CWE-798",
+                line=hit.line,
+                evidence=hit.evidence,
                 description=description,
                 recommendation=RECOMMENDATIONS["hardcoded_credentials"],
             ))

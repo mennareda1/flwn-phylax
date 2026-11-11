@@ -1,7 +1,7 @@
 /**
  * src/types.ts
  *
- * The Phylax HTTP API, as TypeScript types. They mirror openapi.yaml (contract 1.3.0); only the fields a client uses are named, and anything the
+ * The Phylax HTTP API, as TypeScript types. They mirror openapi.yaml (contract 1.4.0); only the fields a client uses are named, and anything the
  * service adds later is tolerated (additive changes never break a client).
  */
 
@@ -53,6 +53,14 @@ export interface Coverage {
   analyzers_run: string[];
   analyzers_failed: Record<string, string>;
   not_assessable: string[];
+  /** Files checked for ONE thing only (configuration and text files: hardcoded secrets). Absent on a service older than contract 1.4.0. */
+  limited_scope?: LimitedScope[];
+}
+
+export interface LimitedScope {
+  path: string;
+  language: string;
+  checked_for: string;
 }
 
 export interface ScanReport {
@@ -123,7 +131,7 @@ export interface Fix {
 
 export interface Capabilities {
   contract_version: string;
-  languages: { id: string; roles: string[] }[];
+  languages: { id: string; roles: string[]; scope?: 'full' | 'secrets_only' }[];
   limits: { max_files: number; max_file_bytes: number; max_total_bytes: number; max_wait_seconds: number };
   retention_hours: number;
   features?: { fixes: boolean; verifications: boolean };

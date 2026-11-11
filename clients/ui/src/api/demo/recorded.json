@@ -1,0 +1,1154 @@
+{
+ "recorded_with": "Phylax contract 1.4.0: the real scanner and verifier, the correction model played by the test stand-in",
+ "project": {
+  "name": "sample-app",
+  "files": {
+   "src/run.js": "const { exec } = require(\"child_process\");\n\n// Lists the files in a folder the user picked in the app.\nfunction run(dir) {\n  exec(`ls ${dir}`);\n}\n\nmodule.exports = { run };\n",
+   "src/db.ts": "import { pool } from \"./pool\";\n\nexport function find(id: string) {\n  return pool.query(`SELECT * FROM t WHERE id = ${id}`);\n}\n",
+   "src/token.js": "// Makes the code sent in a password-reset email.\nfunction makeResetToken() {\n  return Math.random().toString(36).slice(2);\n}\n\nmodule.exports = { makeResetToken };\n",
+   "src/config.js": "const awsKey = \"AKIAJQ7XWB4HNTRCPLMD\";\n\nmodule.exports = { awsKey, region: \"eu-west-1\" };\n",
+   "config/mail.yaml": "smtp:\n  host: smtp.mailrelay.example\n  port: 587\n  user: notifications\n  password: Sm7p!relay2024\n",
+   "src/ok.js": "const add = (a, b) => a + b;\n\nmodule.exports = { add };\n"
+  }
+ },
+ "capabilities": {
+  "contract_version": "1.4.0",
+  "service_version": "0.1.0",
+  "policy_version": "policy-1",
+  "languages": [
+   {
+    "id": "config",
+    "roles": [
+     "analyzer"
+    ],
+    "scope": "secrets_only"
+   },
+   {
+    "id": "ini",
+    "roles": [
+     "analyzer"
+    ],
+    "scope": "secrets_only"
+   },
+   {
+    "id": "javascript",
+    "roles": [
+     "analyzer"
+    ],
+    "scope": "full"
+   },
+   {
+    "id": "json",
+    "roles": [
+     "analyzer"
+    ],
+    "scope": "secrets_only"
+   },
+   {
+    "id": "properties",
+    "roles": [
+     "analyzer"
+    ],
+    "scope": "secrets_only"
+   },
+   {
+    "id": "python",
+    "roles": [
+     "analyzer"
+    ],
+    "scope": "full"
+   },
+   {
+    "id": "text",
+    "roles": [
+     "analyzer"
+    ],
+    "scope": "secrets_only"
+   },
+   {
+    "id": "toml",
+    "roles": [
+     "analyzer"
+    ],
+    "scope": "secrets_only"
+   },
+   {
+    "id": "typescript",
+    "roles": [
+     "analyzer"
+    ],
+    "scope": "full"
+   },
+   {
+    "id": "yaml",
+    "roles": [
+     "analyzer"
+    ],
+    "scope": "secrets_only"
+   }
+  ],
+  "limits": {
+   "max_files": 50,
+   "max_file_bytes": 200000,
+   "max_total_bytes": 1000000,
+   "max_wait_seconds": 30
+  },
+  "retention_hours": 24,
+  "features": {
+   "fixes": true,
+   "verifications": true
+  }
+ },
+ "scans": {
+  "none": {
+   "id": "scn_1c66d6bde3d3ce74",
+   "status": "completed",
+   "created_at": "2026-11-11T19:29:13Z",
+   "completed_at": "2026-11-11T19:29:13Z",
+   "client_ref": null,
+   "report": {
+    "status": "completed",
+    "decision": "block",
+    "risk_level": "high",
+    "findings": [
+     {
+      "id": "f1",
+      "path": "config/mail.yaml",
+      "vulnerability_type": "hardcoded_credentials",
+      "severity": "medium",
+      "confidence": "medium",
+      "evidence_tier": "static_rule",
+      "sources": [
+       "secrets"
+      ],
+      "rule_id": "SECRET-CONFIG",
+      "cwe": "CWE-798",
+      "line": 5,
+      "evidence": "password: ***",
+      "description": "A value that looks like a real secret is set for a credential-named key.",
+      "recommendation": "Move secrets out of source code into environment variables or a secrets manager, and rotate any exposed value.",
+      "reference": null,
+      "fix": {
+       "eligible": false,
+       "reason": "A hardcoded secret is not fixed automatically: remove it from the code, move it to configuration, and rotate it, because it has been exposed."
+      }
+     },
+     {
+      "id": "f2",
+      "path": "src/config.js",
+      "vulnerability_type": "hardcoded_credentials",
+      "severity": "high",
+      "confidence": "medium",
+      "evidence_tier": "static_rule",
+      "sources": [
+       "secrets"
+      ],
+      "rule_id": "SECRET-TOKEN",
+      "cwe": "CWE-798",
+      "line": 1,
+      "evidence": "const awsKey = \"***\";",
+      "description": "A value in the format of a live access key or token is written into the source.",
+      "recommendation": "Move secrets out of source code into environment variables or a secrets manager, and rotate any exposed value.",
+      "reference": null,
+      "fix": {
+       "eligible": false,
+       "reason": "A hardcoded secret is not fixed automatically: remove it from the code, move it to configuration, and rotate it, because it has been exposed."
+      }
+     },
+     {
+      "id": "f3",
+      "path": "src/db.ts",
+      "vulnerability_type": "sql_injection",
+      "severity": "medium",
+      "confidence": "medium",
+      "evidence_tier": "static_rule",
+      "sources": [
+       "jsrules"
+      ],
+      "rule_id": "JS-SQL",
+      "cwe": "CWE-89",
+      "line": 4,
+      "evidence": "return pool.query(`SELECT * FROM t WHERE id = ${id}`);",
+      "description": "A SQL statement is built by joining or interpolating values into the text.",
+      "recommendation": "Use placeholders and pass the values separately (for example $1 or ?), never string building.",
+      "reference": null,
+      "fix": {
+       "eligible": true,
+       "reason": "Medium severity or above: a correction can be offered."
+      }
+     },
+     {
+      "id": "f4",
+      "path": "src/run.js",
+      "vulnerability_type": "command_injection",
+      "severity": "high",
+      "confidence": "high",
+      "evidence_tier": "static_rule",
+      "sources": [
+       "jsrules"
+      ],
+      "rule_id": "JS-EXEC",
+      "cwe": "CWE-78",
+      "line": 5,
+      "evidence": "exec(`ls ${dir}`);",
+      "description": "A shell command from child_process.exec is built from text that is not a fixed value.",
+      "recommendation": "Use execFile or spawn with an argument array and no shell, and validate or allow-list any user-controlled value.",
+      "reference": null,
+      "fix": {
+       "eligible": true,
+       "reason": "Medium severity or above: a correction can be offered."
+      }
+     },
+     {
+      "id": "f5",
+      "path": "src/token.js",
+      "vulnerability_type": "insecure_random",
+      "severity": "low",
+      "confidence": "medium",
+      "evidence_tier": "static_rule",
+      "sources": [
+       "jsrules"
+      ],
+      "rule_id": "JS-RANDOM",
+      "cwe": "CWE-338",
+      "line": 3,
+      "evidence": "return Math.random().toString(36).slice(2);",
+      "description": "Math.random() is predictable and is used for something security-sensitive.",
+      "recommendation": "Use crypto.randomBytes, crypto.randomUUID or crypto.randomInt.",
+      "reference": null,
+      "fix": {
+       "eligible": false,
+       "reason": "Low and informational findings are reported, not corrected by default."
+      }
+     }
+    ],
+    "summary": {
+     "total_findings": 5,
+     "critical": 0,
+     "high": 2,
+     "medium": 2,
+     "low": 1,
+     "info": 0
+    },
+    "decision_reasons": [
+     "1 high-severity, high-confidence finding(s) backed by static analysis (command_injection).",
+     "1 configuration or text file(s) were checked for hardcoded secrets only (config/mail.yaml)."
+    ],
+    "coverage": {
+     "languages": [
+      "javascript",
+      "typescript",
+      "yaml"
+     ],
+     "files_scanned": [
+      "config/mail.yaml",
+      "src/config.js",
+      "src/db.ts",
+      "src/ok.js",
+      "src/run.js",
+      "src/token.js"
+     ],
+     "scanned_files": [
+      {
+       "path": "config/mail.yaml",
+       "sha256": "68a8d1a192f343fc608fcacef3be3389f8f5f50f9a5019a1c091ba302b68eb70"
+      },
+      {
+       "path": "src/config.js",
+       "sha256": "6bb27548ff774756bf628012242c87146942e3094f2cf5e1ee643680eee5ec73"
+      },
+      {
+       "path": "src/db.ts",
+       "sha256": "3fad2fec1a77ab2c36b15125266dd9a9fe3a8ba2cf31fca2d8bb4ecb15f96449"
+      },
+      {
+       "path": "src/ok.js",
+       "sha256": "81f80d386c7072661f870db9236f1eef2e697ddde16f2c18e3614d531bb54008"
+      },
+      {
+       "path": "src/run.js",
+       "sha256": "ced7b1b69153192f9c4e4123b697635804d2ea28d4564c9bba9cb1ec90a3ba7f"
+      },
+      {
+       "path": "src/token.js",
+       "sha256": "20feb154854b01e79db018dee575c80e5962cf019c692a05bb83b98c0d4d7fad"
+      }
+     ],
+     "skipped_files": [],
+     "analyzers_run": [
+      "jsrules",
+      "secrets"
+     ],
+     "analyzers_failed": {},
+     "not_assessable": [
+      "authentication and authorization logic (needs the surrounding application)",
+      "data flow across services and files that were not submitted",
+      "vulnerabilities in third-party dependencies",
+      "deployment, configuration and runtime behavior"
+     ],
+     "limited_scope": [
+      {
+       "path": "config/mail.yaml",
+       "language": "yaml",
+       "checked_for": "hardcoded secrets only"
+      }
+     ]
+    },
+    "provenance": {
+     "contract_version": "1.4.0",
+     "service_version": "0.1.0",
+     "policy_version": "policy-1",
+     "engines": [
+      {
+       "role": "analyzer",
+       "name": "secrets"
+      },
+      {
+       "role": "analyzer",
+       "name": "jsrules"
+      }
+     ]
+    },
+    "duration_ms": 2
+   }
+  },
+  "src/db.ts": {
+   "id": "scn_4857c5fc0c48b75d",
+   "status": "completed",
+   "created_at": "2026-11-11T19:29:13Z",
+   "completed_at": "2026-11-11T19:29:13Z",
+   "client_ref": null,
+   "report": {
+    "status": "completed",
+    "decision": "block",
+    "risk_level": "high",
+    "findings": [
+     {
+      "id": "f1",
+      "path": "config/mail.yaml",
+      "vulnerability_type": "hardcoded_credentials",
+      "severity": "medium",
+      "confidence": "medium",
+      "evidence_tier": "static_rule",
+      "sources": [
+       "secrets"
+      ],
+      "rule_id": "SECRET-CONFIG",
+      "cwe": "CWE-798",
+      "line": 5,
+      "evidence": "password: ***",
+      "description": "A value that looks like a real secret is set for a credential-named key.",
+      "recommendation": "Move secrets out of source code into environment variables or a secrets manager, and rotate any exposed value.",
+      "reference": null,
+      "fix": {
+       "eligible": false,
+       "reason": "A hardcoded secret is not fixed automatically: remove it from the code, move it to configuration, and rotate it, because it has been exposed."
+      }
+     },
+     {
+      "id": "f2",
+      "path": "src/config.js",
+      "vulnerability_type": "hardcoded_credentials",
+      "severity": "high",
+      "confidence": "medium",
+      "evidence_tier": "static_rule",
+      "sources": [
+       "secrets"
+      ],
+      "rule_id": "SECRET-TOKEN",
+      "cwe": "CWE-798",
+      "line": 1,
+      "evidence": "const awsKey = \"***\";",
+      "description": "A value in the format of a live access key or token is written into the source.",
+      "recommendation": "Move secrets out of source code into environment variables or a secrets manager, and rotate any exposed value.",
+      "reference": null,
+      "fix": {
+       "eligible": false,
+       "reason": "A hardcoded secret is not fixed automatically: remove it from the code, move it to configuration, and rotate it, because it has been exposed."
+      }
+     },
+     {
+      "id": "f3",
+      "path": "src/run.js",
+      "vulnerability_type": "command_injection",
+      "severity": "high",
+      "confidence": "high",
+      "evidence_tier": "static_rule",
+      "sources": [
+       "jsrules"
+      ],
+      "rule_id": "JS-EXEC",
+      "cwe": "CWE-78",
+      "line": 5,
+      "evidence": "exec(`ls ${dir}`);",
+      "description": "A shell command from child_process.exec is built from text that is not a fixed value.",
+      "recommendation": "Use execFile or spawn with an argument array and no shell, and validate or allow-list any user-controlled value.",
+      "reference": null,
+      "fix": {
+       "eligible": true,
+       "reason": "Medium severity or above: a correction can be offered."
+      }
+     },
+     {
+      "id": "f4",
+      "path": "src/token.js",
+      "vulnerability_type": "insecure_random",
+      "severity": "low",
+      "confidence": "medium",
+      "evidence_tier": "static_rule",
+      "sources": [
+       "jsrules"
+      ],
+      "rule_id": "JS-RANDOM",
+      "cwe": "CWE-338",
+      "line": 3,
+      "evidence": "return Math.random().toString(36).slice(2);",
+      "description": "Math.random() is predictable and is used for something security-sensitive.",
+      "recommendation": "Use crypto.randomBytes, crypto.randomUUID or crypto.randomInt.",
+      "reference": null,
+      "fix": {
+       "eligible": false,
+       "reason": "Low and informational findings are reported, not corrected by default."
+      }
+     }
+    ],
+    "summary": {
+     "total_findings": 4,
+     "critical": 0,
+     "high": 2,
+     "medium": 1,
+     "low": 1,
+     "info": 0
+    },
+    "decision_reasons": [
+     "1 high-severity, high-confidence finding(s) backed by static analysis (command_injection).",
+     "1 configuration or text file(s) were checked for hardcoded secrets only (config/mail.yaml)."
+    ],
+    "coverage": {
+     "languages": [
+      "javascript",
+      "typescript",
+      "yaml"
+     ],
+     "files_scanned": [
+      "config/mail.yaml",
+      "src/config.js",
+      "src/db.ts",
+      "src/ok.js",
+      "src/run.js",
+      "src/token.js"
+     ],
+     "scanned_files": [
+      {
+       "path": "config/mail.yaml",
+       "sha256": "68a8d1a192f343fc608fcacef3be3389f8f5f50f9a5019a1c091ba302b68eb70"
+      },
+      {
+       "path": "src/config.js",
+       "sha256": "6bb27548ff774756bf628012242c87146942e3094f2cf5e1ee643680eee5ec73"
+      },
+      {
+       "path": "src/db.ts",
+       "sha256": "fa574cfbb6e0c6573d187f863d71c388f98048f9fa79afdfccef38c930ce16cd"
+      },
+      {
+       "path": "src/ok.js",
+       "sha256": "81f80d386c7072661f870db9236f1eef2e697ddde16f2c18e3614d531bb54008"
+      },
+      {
+       "path": "src/run.js",
+       "sha256": "ced7b1b69153192f9c4e4123b697635804d2ea28d4564c9bba9cb1ec90a3ba7f"
+      },
+      {
+       "path": "src/token.js",
+       "sha256": "20feb154854b01e79db018dee575c80e5962cf019c692a05bb83b98c0d4d7fad"
+      }
+     ],
+     "skipped_files": [],
+     "analyzers_run": [
+      "jsrules",
+      "secrets"
+     ],
+     "analyzers_failed": {},
+     "not_assessable": [
+      "authentication and authorization logic (needs the surrounding application)",
+      "data flow across services and files that were not submitted",
+      "vulnerabilities in third-party dependencies",
+      "deployment, configuration and runtime behavior"
+     ],
+     "limited_scope": [
+      {
+       "path": "config/mail.yaml",
+       "language": "yaml",
+       "checked_for": "hardcoded secrets only"
+      }
+     ]
+    },
+    "provenance": {
+     "contract_version": "1.4.0",
+     "service_version": "0.1.0",
+     "policy_version": "policy-1",
+     "engines": [
+      {
+       "role": "analyzer",
+       "name": "secrets"
+      },
+      {
+       "role": "analyzer",
+       "name": "jsrules"
+      }
+     ]
+    },
+    "duration_ms": 1
+   }
+  },
+  "src/run.js": {
+   "id": "scn_0b785d592e2c61c9",
+   "status": "completed",
+   "created_at": "2026-11-11T19:29:13Z",
+   "completed_at": "2026-11-11T19:29:13Z",
+   "client_ref": null,
+   "report": {
+    "status": "completed",
+    "decision": "review_required",
+    "risk_level": "high",
+    "findings": [
+     {
+      "id": "f1",
+      "path": "config/mail.yaml",
+      "vulnerability_type": "hardcoded_credentials",
+      "severity": "medium",
+      "confidence": "medium",
+      "evidence_tier": "static_rule",
+      "sources": [
+       "secrets"
+      ],
+      "rule_id": "SECRET-CONFIG",
+      "cwe": "CWE-798",
+      "line": 5,
+      "evidence": "password: ***",
+      "description": "A value that looks like a real secret is set for a credential-named key.",
+      "recommendation": "Move secrets out of source code into environment variables or a secrets manager, and rotate any exposed value.",
+      "reference": null,
+      "fix": {
+       "eligible": false,
+       "reason": "A hardcoded secret is not fixed automatically: remove it from the code, move it to configuration, and rotate it, because it has been exposed."
+      }
+     },
+     {
+      "id": "f2",
+      "path": "src/config.js",
+      "vulnerability_type": "hardcoded_credentials",
+      "severity": "high",
+      "confidence": "medium",
+      "evidence_tier": "static_rule",
+      "sources": [
+       "secrets"
+      ],
+      "rule_id": "SECRET-TOKEN",
+      "cwe": "CWE-798",
+      "line": 1,
+      "evidence": "const awsKey = \"***\";",
+      "description": "A value in the format of a live access key or token is written into the source.",
+      "recommendation": "Move secrets out of source code into environment variables or a secrets manager, and rotate any exposed value.",
+      "reference": null,
+      "fix": {
+       "eligible": false,
+       "reason": "A hardcoded secret is not fixed automatically: remove it from the code, move it to configuration, and rotate it, because it has been exposed."
+      }
+     },
+     {
+      "id": "f3",
+      "path": "src/db.ts",
+      "vulnerability_type": "sql_injection",
+      "severity": "medium",
+      "confidence": "medium",
+      "evidence_tier": "static_rule",
+      "sources": [
+       "jsrules"
+      ],
+      "rule_id": "JS-SQL",
+      "cwe": "CWE-89",
+      "line": 4,
+      "evidence": "return pool.query(`SELECT * FROM t WHERE id = ${id}`);",
+      "description": "A SQL statement is built by joining or interpolating values into the text.",
+      "recommendation": "Use placeholders and pass the values separately (for example $1 or ?), never string building.",
+      "reference": null,
+      "fix": {
+       "eligible": true,
+       "reason": "Medium severity or above: a correction can be offered."
+      }
+     },
+     {
+      "id": "f4",
+      "path": "src/token.js",
+      "vulnerability_type": "insecure_random",
+      "severity": "low",
+      "confidence": "medium",
+      "evidence_tier": "static_rule",
+      "sources": [
+       "jsrules"
+      ],
+      "rule_id": "JS-RANDOM",
+      "cwe": "CWE-338",
+      "line": 3,
+      "evidence": "return Math.random().toString(36).slice(2);",
+      "description": "Math.random() is predictable and is used for something security-sensitive.",
+      "recommendation": "Use crypto.randomBytes, crypto.randomUUID or crypto.randomInt.",
+      "reference": null,
+      "fix": {
+       "eligible": false,
+       "reason": "Low and informational findings are reported, not corrected by default."
+      }
+     }
+    ],
+    "summary": {
+     "total_findings": 4,
+     "critical": 0,
+     "high": 1,
+     "medium": 2,
+     "low": 1,
+     "info": 0
+    },
+    "decision_reasons": [
+     "3 static-analysis finding(s) at medium severity or above need a human look (hardcoded_credentials, sql_injection).",
+     "1 configuration or text file(s) were checked for hardcoded secrets only (config/mail.yaml)."
+    ],
+    "coverage": {
+     "languages": [
+      "javascript",
+      "typescript",
+      "yaml"
+     ],
+     "files_scanned": [
+      "config/mail.yaml",
+      "src/config.js",
+      "src/db.ts",
+      "src/ok.js",
+      "src/run.js",
+      "src/token.js"
+     ],
+     "scanned_files": [
+      {
+       "path": "config/mail.yaml",
+       "sha256": "68a8d1a192f343fc608fcacef3be3389f8f5f50f9a5019a1c091ba302b68eb70"
+      },
+      {
+       "path": "src/config.js",
+       "sha256": "6bb27548ff774756bf628012242c87146942e3094f2cf5e1ee643680eee5ec73"
+      },
+      {
+       "path": "src/db.ts",
+       "sha256": "3fad2fec1a77ab2c36b15125266dd9a9fe3a8ba2cf31fca2d8bb4ecb15f96449"
+      },
+      {
+       "path": "src/ok.js",
+       "sha256": "81f80d386c7072661f870db9236f1eef2e697ddde16f2c18e3614d531bb54008"
+      },
+      {
+       "path": "src/run.js",
+       "sha256": "6d520c4ced7c5fbcca12536b0d8a4d1130ef4bfbb7202ebbec1c8c7a27d4bf02"
+      },
+      {
+       "path": "src/token.js",
+       "sha256": "20feb154854b01e79db018dee575c80e5962cf019c692a05bb83b98c0d4d7fad"
+      }
+     ],
+     "skipped_files": [],
+     "analyzers_run": [
+      "jsrules",
+      "secrets"
+     ],
+     "analyzers_failed": {},
+     "not_assessable": [
+      "authentication and authorization logic (needs the surrounding application)",
+      "data flow across services and files that were not submitted",
+      "vulnerabilities in third-party dependencies",
+      "deployment, configuration and runtime behavior"
+     ],
+     "limited_scope": [
+      {
+       "path": "config/mail.yaml",
+       "language": "yaml",
+       "checked_for": "hardcoded secrets only"
+      }
+     ]
+    },
+    "provenance": {
+     "contract_version": "1.4.0",
+     "service_version": "0.1.0",
+     "policy_version": "policy-1",
+     "engines": [
+      {
+       "role": "analyzer",
+       "name": "secrets"
+      },
+      {
+       "role": "analyzer",
+       "name": "jsrules"
+      }
+     ]
+    },
+    "duration_ms": 1
+   }
+  },
+  "src/db.ts+src/run.js": {
+   "id": "scn_633bbb245c61e318",
+   "status": "completed",
+   "created_at": "2026-11-11T19:29:13Z",
+   "completed_at": "2026-11-11T19:29:13Z",
+   "client_ref": null,
+   "report": {
+    "status": "completed",
+    "decision": "review_required",
+    "risk_level": "high",
+    "findings": [
+     {
+      "id": "f1",
+      "path": "config/mail.yaml",
+      "vulnerability_type": "hardcoded_credentials",
+      "severity": "medium",
+      "confidence": "medium",
+      "evidence_tier": "static_rule",
+      "sources": [
+       "secrets"
+      ],
+      "rule_id": "SECRET-CONFIG",
+      "cwe": "CWE-798",
+      "line": 5,
+      "evidence": "password: ***",
+      "description": "A value that looks like a real secret is set for a credential-named key.",
+      "recommendation": "Move secrets out of source code into environment variables or a secrets manager, and rotate any exposed value.",
+      "reference": null,
+      "fix": {
+       "eligible": false,
+       "reason": "A hardcoded secret is not fixed automatically: remove it from the code, move it to configuration, and rotate it, because it has been exposed."
+      }
+     },
+     {
+      "id": "f2",
+      "path": "src/config.js",
+      "vulnerability_type": "hardcoded_credentials",
+      "severity": "high",
+      "confidence": "medium",
+      "evidence_tier": "static_rule",
+      "sources": [
+       "secrets"
+      ],
+      "rule_id": "SECRET-TOKEN",
+      "cwe": "CWE-798",
+      "line": 1,
+      "evidence": "const awsKey = \"***\";",
+      "description": "A value in the format of a live access key or token is written into the source.",
+      "recommendation": "Move secrets out of source code into environment variables or a secrets manager, and rotate any exposed value.",
+      "reference": null,
+      "fix": {
+       "eligible": false,
+       "reason": "A hardcoded secret is not fixed automatically: remove it from the code, move it to configuration, and rotate it, because it has been exposed."
+      }
+     },
+     {
+      "id": "f3",
+      "path": "src/token.js",
+      "vulnerability_type": "insecure_random",
+      "severity": "low",
+      "confidence": "medium",
+      "evidence_tier": "static_rule",
+      "sources": [
+       "jsrules"
+      ],
+      "rule_id": "JS-RANDOM",
+      "cwe": "CWE-338",
+      "line": 3,
+      "evidence": "return Math.random().toString(36).slice(2);",
+      "description": "Math.random() is predictable and is used for something security-sensitive.",
+      "recommendation": "Use crypto.randomBytes, crypto.randomUUID or crypto.randomInt.",
+      "reference": null,
+      "fix": {
+       "eligible": false,
+       "reason": "Low and informational findings are reported, not corrected by default."
+      }
+     }
+    ],
+    "summary": {
+     "total_findings": 3,
+     "critical": 0,
+     "high": 1,
+     "medium": 1,
+     "low": 1,
+     "info": 0
+    },
+    "decision_reasons": [
+     "2 static-analysis finding(s) at medium severity or above need a human look (hardcoded_credentials).",
+     "1 configuration or text file(s) were checked for hardcoded secrets only (config/mail.yaml)."
+    ],
+    "coverage": {
+     "languages": [
+      "javascript",
+      "typescript",
+      "yaml"
+     ],
+     "files_scanned": [
+      "config/mail.yaml",
+      "src/config.js",
+      "src/db.ts",
+      "src/ok.js",
+      "src/run.js",
+      "src/token.js"
+     ],
+     "scanned_files": [
+      {
+       "path": "config/mail.yaml",
+       "sha256": "68a8d1a192f343fc608fcacef3be3389f8f5f50f9a5019a1c091ba302b68eb70"
+      },
+      {
+       "path": "src/config.js",
+       "sha256": "6bb27548ff774756bf628012242c87146942e3094f2cf5e1ee643680eee5ec73"
+      },
+      {
+       "path": "src/db.ts",
+       "sha256": "fa574cfbb6e0c6573d187f863d71c388f98048f9fa79afdfccef38c930ce16cd"
+      },
+      {
+       "path": "src/ok.js",
+       "sha256": "81f80d386c7072661f870db9236f1eef2e697ddde16f2c18e3614d531bb54008"
+      },
+      {
+       "path": "src/run.js",
+       "sha256": "6d520c4ced7c5fbcca12536b0d8a4d1130ef4bfbb7202ebbec1c8c7a27d4bf02"
+      },
+      {
+       "path": "src/token.js",
+       "sha256": "20feb154854b01e79db018dee575c80e5962cf019c692a05bb83b98c0d4d7fad"
+      }
+     ],
+     "skipped_files": [],
+     "analyzers_run": [
+      "jsrules",
+      "secrets"
+     ],
+     "analyzers_failed": {},
+     "not_assessable": [
+      "authentication and authorization logic (needs the surrounding application)",
+      "data flow across services and files that were not submitted",
+      "vulnerabilities in third-party dependencies",
+      "deployment, configuration and runtime behavior"
+     ],
+     "limited_scope": [
+      {
+       "path": "config/mail.yaml",
+       "language": "yaml",
+       "checked_for": "hardcoded secrets only"
+      }
+     ]
+    },
+    "provenance": {
+     "contract_version": "1.4.0",
+     "service_version": "0.1.0",
+     "policy_version": "policy-1",
+     "engines": [
+      {
+       "role": "analyzer",
+       "name": "secrets"
+      },
+      {
+       "role": "analyzer",
+       "name": "jsrules"
+      }
+     ]
+    },
+    "duration_ms": 1
+   }
+  }
+ },
+ "fixes": {
+  "src/db.ts": {
+   "id": "fix_694fda4ca59bab1d",
+   "scan_id": "scn_1c66d6bde3d3ce74",
+   "status": "completed",
+   "created_at": "2026-11-11T19:29:13Z",
+   "completed_at": "2026-11-11T19:29:13Z",
+   "patches": [
+    {
+     "path": "src/db.ts",
+     "finding_ids": [
+      "f3"
+     ],
+     "unified_diff": "--- a/src/db.ts\n+++ b/src/db.ts\n@@ -1,5 +1,5 @@\n import { pool } from \"./pool\";\n \n export function find(id: string) {\n-  return pool.query(`SELECT * FROM t WHERE id = ${id}`);\n+  return pool.query(\"SELECT * FROM t WHERE id = $1\", [id]);\n }\n",
+     "explanation": "Use a placeholder.",
+     "base_sha256": "3fad2fec1a77ab2c36b15125266dd9a9fe3a8ba2cf31fca2d8bb4ecb15f96449",
+     "corrected_content": "import { pool } from \"./pool\";\n\nexport function find(id: string) {\n  return pool.query(\"SELECT * FROM t WHERE id = $1\", [id]);\n}\n",
+     "corrected_sha256": "fa574cfbb6e0c6573d187f863d71c388f98048f9fa79afdfccef38c930ce16cd"
+    }
+   ],
+   "verification": {
+    "id": "ver_c738468515e617ad",
+    "scan_id": "scn_1c66d6bde3d3ce74",
+    "status": "completed",
+    "created_at": "2026-11-11T19:29:13Z",
+    "completed_at": "2026-11-11T19:29:13Z",
+    "outcome": "passed",
+    "checks": [
+     {
+      "name": "scope",
+      "result": "pass",
+      "detail": "1 file(s) changed, all of them part of the original scan."
+     },
+     {
+      "name": "syntax",
+      "result": "pass",
+      "detail": "1 changed JavaScript/TypeScript file(s) parse; undefined names are not checked for them yet."
+     },
+     {
+      "name": "patch_size",
+      "result": "pass",
+      "detail": "2 changed line(s), limit 40."
+     },
+     {
+      "name": "rescan",
+      "result": "pass",
+      "detail": "1 requested finding(s) are gone and nothing new backed by a rule appeared."
+     }
+    ],
+    "new_findings": [],
+    "resolved_finding_ids": [
+     "f3"
+    ]
+   },
+   "applicable": true,
+   "failure_reason": null,
+   "unfixed": []
+  },
+  "src/run.js": {
+   "id": "fix_c7686f76a954bbdf",
+   "scan_id": "scn_1c66d6bde3d3ce74",
+   "status": "completed",
+   "created_at": "2026-11-11T19:29:13Z",
+   "completed_at": "2026-11-11T19:29:13Z",
+   "patches": [
+    {
+     "path": "src/run.js",
+     "finding_ids": [
+      "f4"
+     ],
+     "unified_diff": "--- a/src/run.js\n+++ b/src/run.js\n@@ -1,8 +1,8 @@\n-const { exec } = require(\"child_process\");\n+const { execFile } = require(\"child_process\");\n \n // Lists the files in a folder the user picked in the app.\n function run(dir) {\n-  exec(`ls ${dir}`);\n+  execFile(\"ls\", [dir]);\n }\n \n module.exports = { run };\n",
+     "explanation": "Use execFile. Pass the argument as an array.",
+     "base_sha256": "ced7b1b69153192f9c4e4123b697635804d2ea28d4564c9bba9cb1ec90a3ba7f",
+     "corrected_content": "const { execFile } = require(\"child_process\");\n\n// Lists the files in a folder the user picked in the app.\nfunction run(dir) {\n  execFile(\"ls\", [dir]);\n}\n\nmodule.exports = { run };\n",
+     "corrected_sha256": "6d520c4ced7c5fbcca12536b0d8a4d1130ef4bfbb7202ebbec1c8c7a27d4bf02"
+    }
+   ],
+   "verification": {
+    "id": "ver_51b71b2bc91129a2",
+    "scan_id": "scn_1c66d6bde3d3ce74",
+    "status": "completed",
+    "created_at": "2026-11-11T19:29:13Z",
+    "completed_at": "2026-11-11T19:29:13Z",
+    "outcome": "passed",
+    "checks": [
+     {
+      "name": "scope",
+      "result": "pass",
+      "detail": "1 file(s) changed, all of them part of the original scan."
+     },
+     {
+      "name": "syntax",
+      "result": "pass",
+      "detail": "1 changed JavaScript/TypeScript file(s) parse; undefined names are not checked for them yet."
+     },
+     {
+      "name": "patch_size",
+      "result": "pass",
+      "detail": "4 changed line(s), limit 40."
+     },
+     {
+      "name": "rescan",
+      "result": "pass",
+      "detail": "1 requested finding(s) are gone and nothing new backed by a rule appeared."
+     }
+    ],
+    "new_findings": [],
+    "resolved_finding_ids": [
+     "f4"
+    ]
+   },
+   "applicable": true,
+   "failure_reason": null,
+   "unfixed": []
+  },
+  "src/db.ts+src/run.js": {
+   "id": "fix_70f08905c9714630",
+   "scan_id": "scn_1c66d6bde3d3ce74",
+   "status": "completed",
+   "created_at": "2026-11-11T19:29:13Z",
+   "completed_at": "2026-11-11T19:29:13Z",
+   "patches": [
+    {
+     "path": "src/run.js",
+     "finding_ids": [
+      "f4"
+     ],
+     "unified_diff": "--- a/src/run.js\n+++ b/src/run.js\n@@ -1,8 +1,8 @@\n-const { exec } = require(\"child_process\");\n+const { execFile } = require(\"child_process\");\n \n // Lists the files in a folder the user picked in the app.\n function run(dir) {\n-  exec(`ls ${dir}`);\n+  execFile(\"ls\", [dir]);\n }\n \n module.exports = { run };\n",
+     "explanation": "Use execFile. Pass the argument as an array.",
+     "base_sha256": "ced7b1b69153192f9c4e4123b697635804d2ea28d4564c9bba9cb1ec90a3ba7f",
+     "corrected_content": "const { execFile } = require(\"child_process\");\n\n// Lists the files in a folder the user picked in the app.\nfunction run(dir) {\n  execFile(\"ls\", [dir]);\n}\n\nmodule.exports = { run };\n",
+     "corrected_sha256": "6d520c4ced7c5fbcca12536b0d8a4d1130ef4bfbb7202ebbec1c8c7a27d4bf02"
+    },
+    {
+     "path": "src/db.ts",
+     "finding_ids": [
+      "f3"
+     ],
+     "unified_diff": "--- a/src/db.ts\n+++ b/src/db.ts\n@@ -1,5 +1,5 @@\n import { pool } from \"./pool\";\n \n export function find(id: string) {\n-  return pool.query(`SELECT * FROM t WHERE id = ${id}`);\n+  return pool.query(\"SELECT * FROM t WHERE id = $1\", [id]);\n }\n",
+     "explanation": "Use a placeholder.",
+     "base_sha256": "3fad2fec1a77ab2c36b15125266dd9a9fe3a8ba2cf31fca2d8bb4ecb15f96449",
+     "corrected_content": "import { pool } from \"./pool\";\n\nexport function find(id: string) {\n  return pool.query(\"SELECT * FROM t WHERE id = $1\", [id]);\n}\n",
+     "corrected_sha256": "fa574cfbb6e0c6573d187f863d71c388f98048f9fa79afdfccef38c930ce16cd"
+    }
+   ],
+   "verification": {
+    "id": "ver_166f50914dd6993d",
+    "scan_id": "scn_1c66d6bde3d3ce74",
+    "status": "completed",
+    "created_at": "2026-11-11T19:29:13Z",
+    "completed_at": "2026-11-11T19:29:13Z",
+    "outcome": "passed",
+    "checks": [
+     {
+      "name": "scope",
+      "result": "pass",
+      "detail": "2 file(s) changed, all of them part of the original scan."
+     },
+     {
+      "name": "syntax",
+      "result": "pass",
+      "detail": "2 changed JavaScript/TypeScript file(s) parse; undefined names are not checked for them yet."
+     },
+     {
+      "name": "patch_size",
+      "result": "pass",
+      "detail": "6 changed line(s), limit 40."
+     },
+     {
+      "name": "rescan",
+      "result": "pass",
+      "detail": "2 requested finding(s) are gone and nothing new backed by a rule appeared."
+     }
+    ],
+    "new_findings": [],
+    "resolved_finding_ids": [
+     "f3",
+     "f4"
+    ]
+   },
+   "applicable": true,
+   "failure_reason": null,
+   "unfixed": []
+  }
+ },
+ "verifications": {
+  "src/db.ts": {
+   "id": "ver_79193cd90a81aee2",
+   "scan_id": "scn_1c66d6bde3d3ce74",
+   "status": "completed",
+   "created_at": "2026-11-11T19:29:13Z",
+   "completed_at": "2026-11-11T19:29:13Z",
+   "outcome": "passed",
+   "checks": [
+    {
+     "name": "scope",
+     "result": "pass",
+     "detail": "1 file(s) changed, all of them part of the original scan."
+    },
+    {
+     "name": "syntax",
+     "result": "pass",
+     "detail": "1 changed JavaScript/TypeScript file(s) parse; undefined names are not checked for them yet."
+    },
+    {
+     "name": "patch_size",
+     "result": "pass",
+     "detail": "2 changed line(s), limit 200."
+    },
+    {
+     "name": "rescan",
+     "result": "pass",
+     "detail": "1 requested finding(s) are gone and nothing new backed by a rule appeared."
+    }
+   ],
+   "new_findings": [],
+   "resolved_finding_ids": [
+    "f3"
+   ]
+  },
+  "src/run.js": {
+   "id": "ver_bfcd08bbad3dde68",
+   "scan_id": "scn_1c66d6bde3d3ce74",
+   "status": "completed",
+   "created_at": "2026-11-11T19:29:13Z",
+   "completed_at": "2026-11-11T19:29:13Z",
+   "outcome": "passed",
+   "checks": [
+    {
+     "name": "scope",
+     "result": "pass",
+     "detail": "1 file(s) changed, all of them part of the original scan."
+    },
+    {
+     "name": "syntax",
+     "result": "pass",
+     "detail": "1 changed JavaScript/TypeScript file(s) parse; undefined names are not checked for them yet."
+    },
+    {
+     "name": "patch_size",
+     "result": "pass",
+     "detail": "4 changed line(s), limit 200."
+    },
+    {
+     "name": "rescan",
+     "result": "pass",
+     "detail": "1 requested finding(s) are gone and nothing new backed by a rule appeared."
+    }
+   ],
+   "new_findings": [],
+   "resolved_finding_ids": [
+    "f4"
+   ]
+  },
+  "src/db.ts+src/run.js": {
+   "id": "ver_f32f46cf5aeb6f17",
+   "scan_id": "scn_1c66d6bde3d3ce74",
+   "status": "completed",
+   "created_at": "2026-11-11T19:29:14Z",
+   "completed_at": "2026-11-11T19:29:14Z",
+   "outcome": "passed",
+   "checks": [
+    {
+     "name": "scope",
+     "result": "pass",
+     "detail": "2 file(s) changed, all of them part of the original scan."
+    },
+    {
+     "name": "syntax",
+     "result": "pass",
+     "detail": "2 changed JavaScript/TypeScript file(s) parse; undefined names are not checked for them yet."
+    },
+    {
+     "name": "patch_size",
+     "result": "pass",
+     "detail": "6 changed line(s), limit 200."
+    },
+    {
+     "name": "rescan",
+     "result": "pass",
+     "detail": "2 requested finding(s) are gone and nothing new backed by a rule appeared."
+    }
+   ],
+   "new_findings": [],
+   "resolved_finding_ids": [
+    "f3",
+    "f4"
+   ]
+  }
+ }
+}

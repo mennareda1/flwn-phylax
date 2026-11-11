@@ -187,7 +187,7 @@ def run() -> None:
             assert request(base, "GET", "/readyz")[1] == {"status": "ready", "checks": {"job_store": "ok", "analyzers": "ok"}}
             assert request(base, "GET", "/v1/capabilities")[0] == 401
             status, caps, headers = request(base, "GET", "/v1/capabilities", KEY_VIEWER)
-            assert status == 200 and {"id": "python", "roles": ["analyzer", "classifier"]} in caps["languages"] and caps["limits"]["max_wait_seconds"] == 20
+            assert status == 200 and {"id": "python", "roles": ["analyzer", "classifier"], "scope": "full"} in caps["languages"] and caps["limits"]["max_wait_seconds"] == 20
             assert headers["cache-control"] == "no-store" and headers["x-request-id"].startswith("req_")
 
             # ---- a scan end to end: client -> service -> rules AND the model -> report
@@ -207,7 +207,7 @@ def run() -> None:
             # ---- JavaScript through the real process: the same service, a different language
             status, js_scan, _ = request(base, "POST", "/v1/scans", KEY_FLWN, {"files": [{"path": "run.js", "content": 'const { exec } = require("child_process");\nexec(`ls ${dir}`);\n'}]}, {"Prefer": "wait=20"})
             assert status == 200 and js_scan["report"]["decision"] == "block" and js_scan["report"]["findings"][0]["rule_id"] == "JS-EXEC"
-            assert {"id": "javascript", "roles": ["analyzer", "classifier"]} not in caps["languages"] and {"id": "javascript", "roles": ["analyzer"]} in caps["languages"]
+            assert {"id": "javascript", "roles": ["analyzer", "classifier"], "scope": "full"} not in caps["languages"] and {"id": "javascript", "roles": ["analyzer"], "scope": "full"} in caps["languages"]
 
             # ---- a retry is the same scan; a read-only key cannot create; nobody else can read it
             status, again, headers = request(base, "POST", "/v1/scans", KEY_FLWN, {"client_ref": "wi-9", "files": [{"path": "bad.py", "content": CODE}]},

@@ -1,0 +1,70 @@
+@import './tokens.css';
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html { font-size: 100%; }
+  body { margin: 0; min-height: 100dvh; background-color: var(--cream); color: var(--ink); font-family: "Plus Jakarta Sans", Inter, system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+  :focus-visible { outline: 2px solid var(--navy); outline-offset: 2px; }
+  button { font: inherit; color: inherit; }
+}
+
+@layer components {
+  /* The canvas: cream with the dotted grid (SKILL.md section 4). The dot size and spacing are hairline-level drawing values, the only px in the app besides borders. */
+  .canvas {
+    background-color: var(--cream);
+    background-image: radial-gradient(circle, var(--dot) 1.3px, transparent 1.4px); /* brand-ok: the dotted grid */
+    background-size: 24px 24px; /* brand-ok: the dotted grid */
+  }
+  /* Side tabs are pennants: the right end comes to a point. Percentages only. */
+  .pennant { clip-path: polygon(0 0, 86% 0, 100% 50%, 86% 100%, 0 100%); }
+
+  /* Motion (SKILL.md 5b). Every animation uses the tokens; every one has a reduced-motion rule below. */
+  .anim-enter { animation: enter var(--dur) var(--ease-out) both; }
+  .anim-exit { animation: exit var(--dur-fast) var(--ease-in) both; }
+  .anim-fade { animation: fade var(--dur) var(--ease-out) both; }
+  .anim-slide-in { animation: slide-in var(--dur-slow) var(--ease-out) both; }
+  .anim-slide-out { animation: slide-out var(--dur-fast) var(--ease-in) both; }
+  .anim-scrim-in { animation: fade var(--dur-slow) var(--ease-out) both; }
+  .anim-scrim-out { animation: fade-out var(--dur-fast) var(--ease-in) both; }
+  .anim-toast-in { animation: toast-in var(--dur-slow) var(--ease-out) both; }
+  .anim-spin { animation: spin 0.8s linear infinite; }
+  .anim-skeleton { animation: skeleton 1.6s var(--ease-in-out) infinite; }
+  .anim-pulse-ring { animation: pulse-ring 1.6s var(--ease-out) infinite; }
+  .anim-dot { animation: dot-bounce 1.2s var(--ease-in-out) infinite; }
+  .anim-shake { animation: shake var(--dur) var(--ease-in-out) 1; }
+  .anim-draw path { stroke-dasharray: 24; stroke-dashoffset: 24; animation: draw var(--dur-slow) var(--ease-out) forwards; }
+  .anim-countdown { transform-origin: left; animation: countdown var(--toast-time, 5s) linear forwards; }
+  .lift { transition-property: transform, box-shadow, background-color; transition-duration: var(--dur-fast); transition-timing-function: var(--ease-out); }
+  .press:active { transform: scale(0.98); }
+  /* the list of the first eight items glides in, 40ms apart */
+  .stagger > * { animation: enter var(--dur) var(--ease-out) both; }
+  .stagger > *:nth-child(2) { animation-delay: 40ms; } .stagger > *:nth-child(3) { animation-delay: 80ms; } .stagger > *:nth-child(4) { animation-delay: 120ms; }
+  .stagger > *:nth-child(5) { animation-delay: 160ms; } .stagger > *:nth-child(6) { animation-delay: 200ms; } .stagger > *:nth-child(7) { animation-delay: 240ms; } .stagger > *:nth-child(8) { animation-delay: 280ms; }
+}
+
+@keyframes enter { from { opacity: 0; transform: translateY(0.5rem); } to { opacity: 1; transform: none; } }
+@keyframes exit { from { opacity: 1; } to { opacity: 0; transform: translateY(0.25rem); } }
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes fade-out { from { opacity: 1; } to { opacity: 0; } }
+@keyframes slide-in { from { opacity: 0; transform: translateX(1rem); } to { opacity: 1; transform: none; } }
+@keyframes slide-out { from { opacity: 1; } to { opacity: 0; transform: translateX(0.5rem); } }
+@keyframes toast-in { from { opacity: 0; transform: translateY(1rem); } to { opacity: 1; transform: none; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes skeleton { 0%, 100% { opacity: 0.5; } 50% { opacity: 1; } }
+@keyframes pulse-ring { from { transform: scale(1); opacity: 0.4; } to { transform: scale(1.25); opacity: 0; } }
+@keyframes dot-bounce { 0%, 60%, 100% { transform: translateY(0); } 30% { transform: translateY(-0.25rem); } }
+@keyframes shake { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-0.25rem); } 75% { transform: translateX(0.25rem); } }
+@keyframes draw { to { stroke-dashoffset: 0; } }
+@keyframes countdown { from { transform: scaleX(1); } to { transform: scaleX(0); } }
+
+/* Reduced motion (SKILL.md 5b): no movement, scaling, shaking, pulsing or staggering. Opacity fades stay, quick. Spinners and the skeleton pulse stay, because state must still read. */
+@media (prefers-reduced-motion: reduce) {
+  .anim-enter, .anim-exit, .anim-slide-in, .anim-slide-out, .anim-toast-in, .stagger > * { animation-name: fade; animation-duration: var(--dur-fast); animation-delay: 0ms; }
+  .anim-exit, .anim-slide-out { animation-name: fade-out; }
+  .anim-pulse-ring, .anim-dot, .anim-shake { animation: none; }
+  .anim-draw path { animation: none; stroke-dashoffset: 0; }
+  .lift, .press:active { transform: none !important; }
+  .anim-countdown { animation: none; }
+}

@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 520" font-family="Plus Jakarta Sans, Inter, system-ui, sans-serif"><rect width="1200" height="520" fill="#F7F3EA"/>
+<text x="40" y="44" font-size="13" font-weight="600" letter-spacing="1.5" fill="#6B6875">BASE</text>
+<rect x="40" y="58" width="170" height="170" rx="12" fill="#F7F3EA" stroke="#E0DDD5" stroke-width="2"/>
+<text x="56" y="96" font-size="18" font-weight="700" fill="#14131A">Cream</text><text x="56" y="120" font-size="14" fill="#14131A">#F7F3EA</text><text x="56" y="208" font-size="13" fill="#14131A">page background</text>
+<rect x="224" y="58" width="170" height="170" rx="12" fill="#FFFFFF" stroke="#E0DDD5" stroke-width="2"/>
+<text x="240" y="96" font-size="18" font-weight="700" fill="#14131A">White</text><text x="240" y="120" font-size="14" fill="#14131A">#FFFFFF</text><text x="240" y="208" font-size="13" fill="#14131A">surfaces, tables</text>
+<rect x="408" y="58" width="170" height="170" rx="12" fill="#001F55" stroke="#E0DDD5" stroke-width="2"/>
+<text x="424" y="96" font-size="18" font-weight="700" fill="#FFFFFF">Navy</text><text x="424" y="120" font-size="14" fill="#FFFFFF">#001F55</text><text x="424" y="208" font-size="13" fill="#FFFFFF">wordmark, dark anchor</text>
+<rect x="592" y="58" width="170" height="170" rx="12" fill="#14131A" stroke="#E0DDD5" stroke-width="2"/>
+<text x="608" y="96" font-size="18" font-weight="700" fill="#FFFFFF">Ink</text><text x="608" y="120" font-size="14" fill="#FFFFFF">#14131A</text><text x="608" y="208" font-size="13" fill="#FFFFFF">text</text>
+<rect x="776" y="58" width="170" height="170" rx="12" fill="#6B6875" stroke="#E0DDD5" stroke-width="2"/>
+<text x="792" y="96" font-size="18" font-weight="700" fill="#FFFFFF">Ink soft</text><text x="792" y="120" font-size="14" fill="#FFFFFF">#6B6875</text><text x="792" y="208" font-size="13" fill="#FFFFFF">secondary text</text>
+<rect x="960" y="58" width="170" height="170" rx="12" fill="#E0DDD5" stroke="#E0DDD5" stroke-width="2"/>
+<text x="976" y="96" font-size="18" font-weight="700" fill="#14131A">Border</text><text x="976" y="120" font-size="14" fill="#14131A">#E0DDD5</text><text x="976" y="208" font-size="13" fill="#14131A">lines, frames</text>
+<text x="40" y="290" font-size="13" font-weight="600" letter-spacing="1.5" fill="#6B6875">PASTEL ACCENTS</text>
+<rect x="40" y="304" width="208" height="170" rx="12" fill="#B3E3C4" stroke="#E0DDD5" stroke-width="2"/>
+<text x="56" y="342" font-size="18" font-weight="700" fill="#14131A">Green</text><text x="56" y="366" font-size="14" fill="#14131A">#B3E3C4</text><text x="56" y="454" font-size="13" fill="#14131A">tip</text>
+<rect x="262" y="304" width="208" height="170" rx="12" fill="#E3D3FA" stroke="#E0DDD5" stroke-width="2"/>
+<text x="278" y="342" font-size="18" font-weight="700" fill="#14131A">Lavender</text><text x="278" y="366" font-size="14" fill="#14131A">#E3D3FA</text><text x="278" y="454" font-size="13" fill="#14131A">decision</text>
+<rect x="484" y="304" width="208" height="170" rx="12" fill="#F8DB99" stroke="#E0DDD5" stroke-width="2"/>
+<text x="500" y="342" font-size="18" font-weight="700" fill="#14131A">Gold</text><text x="500" y="366" font-size="14" fill="#14131A">#F8DB99</text><text x="500" y="454" font-size="13" fill="#14131A">note, favicon</text>
+<rect x="706" y="304" width="208" height="170" rx="12" fill="#F5B3AC" stroke="#E0DDD5" stroke-width="2"/>
+<text x="722" y="342" font-size="18" font-weight="700" fill="#14131A">Salmon</text><text x="722" y="366" font-size="14" fill="#14131A">#F5B3AC</text><text x="722" y="454" font-size="13" fill="#14131A">warning</text>
+<rect x="928" y="304" width="208" height="170" rx="12" fill="#ABE1EA" stroke="#E0DDD5" stroke-width="2"/>
+<text x="944" y="342" font-size="18" font-weight="700" fill="#14131A">Blue</text><text x="944" y="366" font-size="14" fill="#14131A">#ABE1EA</text><text x="944" y="454" font-size="13" fill="#14131A">info</text>
+</svg>

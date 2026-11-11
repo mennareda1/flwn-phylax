@@ -119,7 +119,7 @@ person choose which to correct, show each correction as a diff, apply it only af
 interfaces (`FileChanger` and `Approver`), so it is not tied to Oqelira: Oqelira has an adapter built on its own `changes.mjs`, a plain-folder adapter works with any agent,
 and a command-line tool (`phylax-review`) works with none. Run its tests with `python -m tests.check_ts_client` (needs Node 20+ and `npm install` once in that folder).
 
-Which findings are offered a correction is decided by the service, per finding, in `finding.fix` (contract 1.3.0): medium severity and above yes; low and informational
+Which findings are offered a correction is decided by the service, per finding, in `finding.fix` (contract 1.4.0): medium severity and above yes; low and informational
 reported only; a hardcoded secret never. It does not depend on the verdict: a medium finding is offered when the decision is only `review_required`, and a `block` does
 not make a low finding eligible.
 
@@ -155,6 +155,33 @@ Limits that belong to the apply tool, not Phylax: it takes files up to 10,000 ch
 it; it refuses `.env`, key files and anything under `.git` or `.oqelira`. `tests/check_interop.py` runs Oqelira's real `changes.mjs` under Node
 (a copy is in `tests/fixtures/`) and proves all of this on real files: equal hashes for LF, CRLF and non-ASCII text, a Phylax patch accepted, a stale
 patch refused, and an exact revert. It needs Node and says SKIPPED without it.
+
+## Configuration files (secrets only)
+
+`.json .yaml .yml .toml .ini .properties .config .txt` files are checked for **hardcoded secrets and nothing else**, and every report says so: the files are listed under `coverage.limited_scope`
+(contract 1.4.0) and the verdict's reasons say "N configuration or text file(s) were checked for hardcoded secrets only". A clean result for such a file says nothing about the rest of what it contains.
+
+What it finds: `password: x`, `db.password=x`, `"api_key": "x"`, a password inside a connection URL (`postgres://user:secret@host/db`), inside a connection string (`Password=x;`) or a JDBC query
+string, XML settings (`<add key="ApiKey" value="x"/>`), the known token formats, private-key blocks, and credentials left in a comment. What it leaves alone: references (`${DB_PASSWORD}`,
+`{{ vault_x }}`, `ENC(...)`, `!secret x`), placeholders (`changeme`, `<your-password>`, `********`), keys that only mention a credential (`token_url`, `password_min_length`), dependency
+version ranges, and a pure dictionary passphrase (`correcthorsebatterystaple`, a known false negative). The secret value is masked in every evidence line, quoted or not.
+
+A secret is never corrected by editing code, in a config file or anywhere else: it is reported (as a review, never a block) with the advice to remove it and rotate it.
+Folder scans (`python -m security_service.scan .` and the TypeScript client) pick these files up and skip lock files, minified JSON, `.env*` files and keys.
+
+Measured once on 40 whole files written after the detector was frozen: 17 of 20 vulnerable files found, 1 of 20 false alarms (`benchmark/results/config_heldout_verdict.md`). The two defects that run
+found were fixed afterwards, so those 40 files are now development data. Check it yourself: `python -m security_service.core.config_secrets` and `python -m benchmark.config_eval`.
+
+## Measuring fix quality on JavaScript and TypeScript
+
+The service's four checks on a correction (scope, syntax, size, re-scan) say the fix is *safe*; they cannot say it still *does the same thing*. `benchmark/fix_eval.py` measures that on 11 small cases
+(8 JavaScript, 3 TypeScript): the original and the fixed code are run in Node with the dangerous functions replaced by recorders, and what they did is compared.
+
+    python -m benchmark.fix_eval                  # self-test with a scripted stand-in: no model, no key, no cost
+    python -m benchmark.fix_eval --real           # the real Astra on every case (about 11 requests) and a report in benchmark/results/
+    python -m benchmark.fix_eval --real --repeat 3 --only fx-js-sql-concat
+
+Needs Node on PATH (22.6 or newer for the TypeScript cases). These are development cases, not a held-out set: see the limits section of the report it writes.
 
 ## JavaScript and TypeScript
 
@@ -346,7 +373,11 @@ Built for JavaScript and TypeScript: our own 25 rules, the secrets check, folder
 
 Built for Decision-1 on JavaScript and TypeScript: the questions, 51 development and 39 held-out cases, a language switch in the evaluation, and a setting that keeps it off until it passes. NOT yet run against the real model.
 
-Not built yet for JavaScript and TypeScript: the result of Decision-1's held-out test, the undefined-name check, and a real Astra fix run on JavaScript. Not built yet: Java.
+Built for configuration files: the secrets-only lane (`.json .yaml .yml .toml .ini .properties .config .txt`), explicit coverage in every report, a 40-file held-out measurement, folder scanning in both tools.
+
+Built for fix quality: a Node-based behavior check and 11 JavaScript and TypeScript cases (`benchmark/fix_eval.py`), self-tested; NOT yet run against the real Astra.
+
+Not built yet for JavaScript and TypeScript: the result of Decision-1's held-out test (waiting for a real run), the undefined-name check, and a measured Astra fix rate (waiting for a real run). Not built yet: Java, C#, C.
 
 Not built yet: the measured fix-quality test (the pass/fail rule fixed first, then new cases), an optional behavior check that runs a project's own tests, the Flwn side of the
 integration, chunking of large files for the model, a persistent job store and a shared rate limiter for running several

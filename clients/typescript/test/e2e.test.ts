@@ -89,7 +89,7 @@ const choosesAll = (): ScriptedPerson => new ScriptedPerson((c) => c.map((x) => 
 test('the service speaks the contract this client was written against', { timeout: 90_000 }, async (t) => {
   if (!service) return t.skip(skipReason ?? 'no service');
   const capabilities = await api().capabilities();
-  assert.equal(capabilities.contract_version, '1.3.0');
+  assert.equal(capabilities.contract_version, '1.4.0');
   assert.equal(capabilities.features?.fixes, true);
   assert.ok(capabilities.limits.max_files >= 1);
   await assert.rejects(new HttpPhylaxApi({ baseUrl: service.url, apiKey: 'wrong-key-wrong-key-wrong-key' }).capabilities(), (e: unknown) => e instanceof PhylaxApiError && e.code === 'unauthorized' && e.status === 401);
@@ -130,6 +130,27 @@ test('a full review of a project: scan, choose, approve, apply, verify, with a W
     const again = await new SecurityReview({ phylax: api(), files: new DiskFileChanger(project.root) }).scan({ kind: 'project' });
     assert.equal(again.decision, 'pass', 'a new scan of the corrected project passes');
     assert.deepEqual(again.correctable, []);
+  } finally { await project.cleanup(); }
+});
+
+test('configuration files are checked for secrets only: reported, never offered for correction, never touched; a dependency range is not a secret', { timeout: 90_000 }, async (t) => {
+  if (!service) return t.skip(skipReason ?? 'no service');
+  const YAML = 'db:\n  user: app\n  password: hunter2secret\n';
+  const PACKAGE = '{\n  "name": "dashboard",\n  "dependencies": { "jsonwebtoken": "^9.0.2", "passport": "~0.7.0", "bcrypt": ">=5.1.0 <6" }\n}\n';
+  const project = await tempProject({ 'config/app.yaml': YAML, 'package.json': PACKAGE, 'settings.json': '{ "port": 8080 }\n', 'notes.txt': 'see the wiki\n' });
+  try {
+    const counted = counting(api());
+    const result = await new SecurityReview({ phylax: counted.api, files: new DiskFileChanger(project.root) }).runInteractive({ kind: 'project' }, choosesAll());
+    const { summary } = result;
+    assert.equal(summary.decision, 'review_required', 'a secret asks for a person, it never blocks');
+    assert.deepEqual(summary.correctable, [], 'a secret is not fixed by editing code');
+    assert.deepEqual(summary.reportOnly.map((f) => f.finding.path), ['config/app.yaml'], 'only the real secret is reported: package.json, settings.json and notes.txt are clean');
+    assert.equal(summary.reportOnly[0]?.finding.rule_id, 'SECRET-CONFIG');
+    assert.equal(summary.reportOnly[0]?.finding.line, 3);
+    assert.match(summary.reportOnly[0]?.finding.fix.reason ?? '', /not fixed automatically/);
+    assert.equal(counted.fixes(), 0, 'no correction is ever requested for a secret');
+    assert.equal(await readFile(path.join(project.root, 'config/app.yaml'), 'utf8'), YAML, 'the file was not touched');
+    assert.doesNotMatch(JSON.stringify(summary), /hunter2secret/, 'the secret value is not in what the client holds about the finding');
   } finally { await project.cleanup(); }
 });
 

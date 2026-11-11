@@ -196,6 +196,7 @@ class Coverage:
     analyzers_run: list[str] = field(default_factory=list)
     analyzers_failed: dict[str, str] = field(default_factory=dict)
     not_assessable: list[str] = field(default_factory=lambda: list(NOT_ASSESSABLE_FROM_SUBMITTED_FILES))
+    limited_scope: list[dict[str, str]] = field(default_factory=list)       # [{path, language, checked_for}]: files that were checked for ONE thing only (configuration files: hardcoded secrets)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -206,6 +207,7 @@ class Coverage:
             "analyzers_run": list(self.analyzers_run),
             "analyzers_failed": dict(self.analyzers_failed),
             "not_assessable": list(self.not_assessable),
+            "limited_scope": [dict(item) for item in self.limited_scope],
         }
 
 
